@@ -5,7 +5,9 @@ Builds the hex arcology from ultra-low-poly proxy shapes (hex prisms, boxes and 
 your detailed modules, so it can rebuild live while you drag the sliders in the sidebar.
 
 Install: Edit > Preferences > Add-ons > Install from Disk, pick this file, tick the add-on on.
-Use: 3D Viewport > N sidebar > "Arcology" tab.
+Use: 3D Viewport > N sidebar > "Arcology" tab. Under Build, pick the shape: Hexagon, Octagon or Rectangle.
+Each shape has its own settings and makes its own city. Build replaces the city in the scene, and Clear
+removes it.
 
 Every change to a slider rebuilds the city a moment later (turn "Live" off to rebuild by hand).
 Output goes to the "Arcology Proxy" collection, or to the collections you pick in the Collections box.
@@ -19,7 +21,7 @@ so it can be sculpted into slopes. Without one, every hex gets the layer cap.
 bl_info = {
     "name": "Modular Hexagonal Arcology Generator",
     "author": "Traveling",
-    "version": (1, 0, 0),
+    "version": (2, 0, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Arcology",
     "description": "Generates the hex arcology from ultra-low-poly proxies, live, with sliders.",
@@ -35,7 +37,7 @@ from types import SimpleNamespace
 
 import bpy
 import bmesh
-from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Matrix, Vector  # noqa: F401  (Matrix kept for users who extend the script)
 from mathutils.bvhtree import BVHTree
@@ -85,6 +87,7 @@ TRI_CELLS = [(0, 0), (1, 0), (1, -1)]
 CAT_COLORS = {
     "tiles": (0.78, 0.74, 0.66, 1.0),
     "roads": (0.22, 0.22, 0.24, 1.0),
+    "road_octagons": (0.30, 0.30, 0.33, 1.0),
     "roofs": (0.55, 0.55, 0.58, 1.0),
     "towers": (0.92, 0.91, 0.88, 1.0),
     "trapezoids": (0.70, 0.62, 0.52, 1.0),
@@ -96,6 +99,7 @@ CAT_COLORS = {
     "columns": (0.80, 0.78, 0.72, 1.0),
     "paths": (0.80, 0.76, 0.66, 1.0),
     "walls": (0.85, 0.85, 0.80, 1.0),
+    "squares": (0.80, 0.80, 0.78, 1.0),
 }
 
 _pending = False                  # a live rebuild is waiting in the timer queue
@@ -231,19 +235,37 @@ def lattice_points(inside, lo, hi, rng, L):
     return pts
 
 
-def random_roads(pts, rng, chance):
+def choose_lines(lines, rng, chance, max_gap, min_gap=0):
+    """Decides which lines (rows, columns, diagonals, in order) are roads. Each line is a road with the
+    road chance, but never more than max_gap lines in a row go without one, and at least min_gap lines
+    must sit between two roads, so roads are never back to back."""
+    chosen = {}
+    run = min_gap                                   # lines since the last road; the first road is free
+    for lk in sorted(lines):
+        road = rng.random() < chance
+        if run < min_gap:
+            road = False
+        elif not road and run >= max_gap:
+            road = True
+        chosen[lk] = road
+        run = 0 if road else run + 1
+    return chosen
+
+
+def random_roads(pts, rng, chance, max_gap, min_gap=0):
     """Random straight roads of hex centres. Returns (runs, degree)."""
     chosen = {}
     edges = []
     degree = {k: 0 for k in pts}
     for f_index, (name, step, line_key) in enumerate(FAMILIES):
+        lines = {line_key(*key) for key in pts if step(*key) in pts}
+        for lk, road in choose_lines(lines, rng, chance, max_gap, min_gap).items():
+            chosen[(f_index, lk)] = road
         for key in sorted(pts):
             n = step(*key)
             if n not in pts:
                 continue
             line = (f_index, line_key(*key))
-            if line not in chosen:
-                chosen[line] = rng.random() < chance
             if chosen[line]:
                 edges.append((f_index, key, n))
                 degree[key] += 1
@@ -393,6 +415,84 @@ def add_path(bm, c, z0, rng, L, edges):
                 o = _hex_dir(m * math.tau / 6.0 + math.pi / 2.0)
             else:
                 o = norms[-1]
+        else:
+            vn = (norms[i - 1] + norms[i]).normalized()
+            o = vn / max(vn.dot(norms[i]), 0.5)
+        offs.append(o * (w / 2.0))
+    left = [bm.verts.new((clean[i].x + offs[i].x, clean[i].y + offs[i].y, z0)) for i in range(n)]
+    right = [bm.verts.new((clean[i].x - offs[i].x, clean[i].y - offs[i].y, z0)) for i in range(n)]
+    for i in range(n - 1):
+        try:
+            bm.faces.new((left[i], left[i + 1], right[i + 1], right[i]))
+        except ValueError:
+            pass
+
+
+def _clamp_oct(p, c, lim):
+    """Pulls p inside the octagon of apothem lim around c (its sides face 0, 45, 90 ... degrees)."""
+    q = p - c
+    for k in range(8):
+        a = k * math.pi / 4.0
+        n = Vector((math.cos(a), math.sin(a)))
+        d = q.dot(n)
+        if d > lim:
+            q -= n * (d - lim)
+    return c + q
+
+
+def add_oct_path(bm, c, z0, rng, L, sides):
+    """A winding roof path through one octagon cell, 4 ft wide, made of exactly six flat quads (six
+    planes). sides: the axial sides (0 east, 2 north, 4 west, 6 south) whose neighbour also has a path,
+    so the path runs edge midpoint to edge midpoint and meets the next cell there. With no neighbours
+    it runs across the cell; with one it ends in the middle of the cell."""
+    def dirv(m):
+        a = m * math.pi / 4.0
+        return Vector((math.cos(a), math.sin(a)))
+    w = PATH_WIDTH_FT * FT
+    lim = L.APO - w / 2.0
+    if len(sides) >= 2:
+        anchors = [c + dirv(m) * L.APO for m in sorted(sides)]
+    elif sides:
+        m = sides[0]
+        anchors = [c + dirv(m) * L.APO, c + dirv((m + 4) % 8) * (L.APO * 0.5)]
+    else:
+        a = rng.random() * math.tau
+        anchors = [c + dirv(a / (math.pi / 4.0)) * (L.APO * 0.6), c - dirv(a / (math.pi / 4.0)) * (L.APO * 0.6)]
+    bends = 7 - len(anchors)                  # 6 quads = (points - 1), points = anchors + bends
+    segs = len(anchors) - 1
+    share = [bends // segs] * segs
+    for _ in range(bends - sum(share)):
+        share[rng.randrange(segs)] += 1
+    pts = [anchors[0]]
+    for i in range(segs):
+        p0, p1, k = anchors[i], anchors[i + 1], share[i]
+        d = p1 - p0
+        across = Vector((-d.y, d.x)).normalized()
+        sign = 1.0
+        spacing = d.length / (k + 1.0)
+        for j in range(1, k + 1):
+            t = j / (k + 1.0)
+            amp = rng.uniform(0.20, 0.30) * spacing * math.sin(math.pi * t)
+            pts.append(_clamp_oct(p0.lerp(p1, t) + across * (sign * amp), c, lim))
+            sign = -sign
+        pts.append(p1)
+    clean = [pts[0]]
+    for q in pts[1:]:
+        if (q - clean[-1]).length > 1e-6:
+            clean.append(q)
+    if len(clean) < 2:
+        return
+    n = len(clean)
+    norms = []
+    for i in range(n - 1):
+        d = (clean[i + 1] - clean[i]).normalized()
+        norms.append(Vector((-d.y, d.x)))
+    offs = []
+    for i in range(n):
+        if i == 0:
+            o = norms[0]
+        elif i == n - 1:
+            o = norms[-1]
         else:
             vn = (norms[i - 1] + norms[i]).normalized()
             o = vn / max(vn.dot(norms[i]), 0.5)
@@ -595,7 +695,8 @@ def _source_geometry(o):
     hull = convex_hull_2d([Vector((v.x - bc.x, v.y - bc.y)) for v in sample])
     org = o.matrix_world.translation.copy()
     c0 = Vector((org.x, org.y))
-    hull0 = convex_hull_2d([Vector((v.x - c0.x, v.y - c0.y)) for v in sample])
+    # The flat side is read from every vertex, not the sample: a sampled hull can pick a different long edge.
+    hull0 = convex_hull_2d([Vector((v.x - c0.x, v.y - c0.y)) for v in verts])
     # Trapezoid flat side: outward normal of the longest edge of the footprint, seen from the origin.
     flat_normal = Vector((0.0, 1.0))
     if len(hull0) >= 2:
@@ -667,19 +768,19 @@ def trap_record(pool, rng, spot, k, L):
             "matrix": T @ Rm @ Sz @ C @ src["obj"].matrix_world}
 
 
-def elevator_record(pool, rng, c, z, height, layer):
+def elevator_record(pool, rng, c, z, height, layer, xy=1.0):
     """A copy of one Elevators object, replacing all six shafts of one transport hex on one level. Its
     origin sits at the centre of the hex cell; it keeps its own orientation, and is one level tall."""
     src = pool[rng.randrange(len(pool))]
     kz = height / src["height"] if src["height"] > 0 else 1.0
     C = Matrix.Translation((-src["c0"].x, -src["c0"].y, -src["zb"]))
-    Sz = Matrix.Diagonal(Vector((1.0, 1.0, kz, 1.0)))
+    Sz = Matrix.Diagonal(Vector((xy, xy, kz, 1.0)))            # xy scales the shaft with the octagon edge
     T = Matrix.Translation((c.x, c.y, z))
     return {"group": "Elevators", "cat": "elevators", "layer": layer, "src": src,
             "matrix": T @ Sz @ C @ src["obj"].matrix_world}
 
 
-def wall_record(pool, rng, centre, ang, z, height, layer, L):
+def wall_record(pool, rng, centre, ang, z, height, layer, L, length=None, thick=None):
     """A copy of one Walls object on an exposed side of a hex. In your source the exterior faces west and
     the length runs north/south. It is turned so the exterior faces out of the hex, then stretched to the
     wall's slot: one hex edge long, WALL_T thick and one level tall."""
@@ -689,8 +790,10 @@ def wall_record(pool, rng, centre, ang, z, height, layer, L):
     ext_x = max(xs) - min(xs)
     ext_y = max(ys) - min(ys)
     theta = math.radians(ang) + math.pi          # source -X (west, its exterior) points along the outward normal
-    sx = L.WALL_T / ext_x if ext_x > 1e-9 else 1.0
-    sy = L.R / ext_y if ext_y > 1e-9 else 1.0
+    wt = L.WALL_T if thick is None else thick
+    wl = L.R if length is None else length
+    sx = wt / ext_x if ext_x > 1e-9 else 1.0
+    sy = wl / ext_y if ext_y > 1e-9 else 1.0
     sz = height / src["height"] if src["height"] > 0 else 1.0
     M = (Matrix.Translation((centre.x, centre.y, z))
          @ Matrix.Rotation(theta, 4, 'Z')
@@ -781,6 +884,7 @@ def write_copies(scene, records):
 
 def build_city(p):
     L = make_layout(p)
+    road_w = p.road_width_ft * FT                        # the road width set in the Size box
     fp = footprint_object(p)
     height_at, lo, hi = mesh_height_tester(fp)
     inside = lambda x, y: height_at(x, y) is not None
@@ -822,7 +926,7 @@ def build_city(p):
                 n = layers_under(z, L)
         hmax[key] = max(1, min(cap, n))
 
-    runs, degree = random_roads(pts, rng, p.road_chance)
+    runs, degree = random_roads(pts, rng, p.road_chance, p.max_cells_between_roads, p.min_cells_between_roads)
     spots = trapezoid_spots(runs, pts, degree, hmax, L)
     trap_keys = {s["key"] for s in spots}
 
@@ -907,10 +1011,10 @@ def build_city(p):
             d = (pts[run[-1]] - pts[run[0]]).normalized()
             for key in run:
                 c = pts[key]
-                add_prism(bucket("roads", 1), rect_poly(c, d, L.S / 2.0, ROAD_W / 2.0), ROAD_BASE, ROAD_BASE + ROAD_H)
+                add_prism(bucket("roads", 1), rect_poly(c, d, L.S / 2.0, road_w / 2.0), ROAD_BASE, ROAD_BASE + ROAD_H)
                 for k in range(1, hmax[key] - 1):
                     z = ROAD_BASE + k * P
-                    add_prism(bucket("roads", k + 1), rect_poly(c, d, L.S / 2.0, ROAD_W / 2.0), z, z + ROAD_H)
+                    add_prism(bucket("roads", k + 1), rect_poly(c, d, L.S / 2.0, road_w / 2.0), z, z + ROAD_H)
 
     # Trapezoids: stacked up to the layer under each hex's top.
     if p.show_trapezoids:
@@ -1065,6 +1169,555 @@ def build_city(p):
     return buckets, stats, records
 
 
+
+# ---------------------------------------------------------------------------
+# Octagon city (its own tab). Octagons sit on a square grid with pitch D = edge * (1 + sqrt 2), so
+# neighbours share sides across the axes, and the gap between four octagons is a square (side = edge)
+# turned 45 degrees. Roads run through the octagon centres, along the rows and columns.
+# ---------------------------------------------------------------------------
+SHAPE_HEX = "HEXAGON"
+SHAPE_OCT = "OCTAGON"
+SHAPE_RECT = "RECTANGLE"
+SQRT2 = math.sqrt(2.0)
+OCT_ANGLES = tuple(22.5 + 45.0 * k for k in range(8))     # octagon corners; its sides face 0, 45, 90 ...
+OCT_AXIAL = {0: (1, 0), 2: (0, 1), 4: (-1, 0), 6: (0, -1)} # side index -> neighbour step (sides 0,2,4,6 face axes)
+OCT_DIAG_SQUARE = {1: (0, 0), 3: (-1, 0), 5: (-1, -1), 7: (0, -1)}   # diagonal side index -> gap square key
+SQ_SIDE_OCT = {45: (1, 1), 135: (0, 1), 225: (0, 0), 315: (1, 0)}    # square side angle -> octagon key
+# Elevator shafts in a transport octagon: eight 14 ft square shafts, turned 45 degrees, from the octagon centre
+OCT_SHAFT_FT = 14.0
+OCT_EDGE_DEFAULT = 33.35 / math.sqrt(3.0)     # the octagon edge the shafts were sized for
+OCT_SHAFT_OFFSETS_FT = tuple(
+    (sx * dx, sy * dy)
+    for dx, dy in ((35.9, 62.6), (62.6, 35.9))
+    for sx in (-1, 1) for sy in (-1, 1))
+
+
+def oct_layout(p):
+    """Octagon geometry from its own edge length (in metres)."""
+    e = p.oct_edge
+    apo = e * (1.0 + SQRT2) / 2.0                        # centre to side
+    R = e / (2.0 * math.sin(math.radians(22.5)))         # centre to corner
+    return SimpleNamespace(
+        EDGE=e, APO=apo, R=R, S=2.0 * apo, D=e * (1.0 + SQRT2),
+        HEX_H=p.level_ft * FT, ROOF_H=p.roof_ft * FT, PITCH=p.level_ft * FT + p.roof_ft * FT,
+        WALL_T=WALL_THICK_FRAC * 2.0 * apo, ROAD_W=p.road_width_ft * FT,
+    )
+
+
+def oct_ring(c, radius):
+    return [Vector((c.x + radius * math.cos(math.radians(a)), c.y + radius * math.sin(math.radians(a))))
+            for a in OCT_ANGLES]
+
+
+def square_ring(c, edge):
+    """A square turned 45 degrees, so each side faces a diagonal side of an octagon."""
+    r = edge / SQRT2
+    return [Vector((c.x + r * math.cos(k * math.tau / 4), c.y + r * math.sin(k * math.tau / 4)))
+            for k in range(4)]
+
+
+def fit_to_poly(piece, theta, apothem, sides, offset_deg=0.0):
+    """Largest uniform XY scale at which the piece, turned by theta, stays inside a regular polygon
+    with the given number of sides, apothem and side offset."""
+    pts = [rot2(p, theta) for p in piece["hull"]]
+    s = 1e6
+    for k in range(sides):
+        ang = math.radians(offset_deg + 360.0 * k / sides)
+        nrm = Vector((math.cos(ang), math.sin(ang)))
+        reach = max(p.dot(nrm) for p in pts)
+        if reach > 1e-6:
+            s = min(s, apothem / reach)
+    return s
+
+
+def poly_record(pool, rng, c, z, height, layer, apothem, sides, offset_deg, group, cat):
+    """A copy of one of your objects, turned in steps of 360/sides degrees, filling a regular polygon
+    and stretched to the given height. Used for octagons, squares and octagon roofs."""
+    src = pool[rng.randrange(len(pool))]
+    theta = rng.randrange(sides) * math.tau / sides
+    s = fit_to_poly(src, theta, apothem, sides, offset_deg)
+    kz = height / src["height"] if src["height"] > 0 else 1.0
+    P_ = Matrix.Translation((c.x, c.y, z)) @ Matrix.Rotation(theta, 4, 'Z')
+    Sc = Matrix.Diagonal(Vector((s, s, kz, 1.0)))
+    T = Matrix.Translation(-src["bottom_center"])
+    return {"group": group, "cat": cat, "layer": layer, "src": src,
+            "matrix": P_ @ Sc @ T @ src["obj"].matrix_world}
+
+
+def oct_lattice(inside, lo, hi, rng, L):
+    """Octagon centres (inside the footprint) and gap-square centres (inside the footprint).
+    The grid starts at a random offset, as the hexagon lattice does."""
+    D = L.D
+    ox = lo.x + rng.random() * D
+    oy = lo.y + rng.random() * D
+    octs, sqs = {}, {}
+    i_min = int(math.floor((lo.x - ox) / D)) - 2
+    i_max = int(math.ceil((hi.x - ox) / D)) + 2
+    j_min = int(math.floor((lo.y - oy) / D)) - 2
+    j_max = int(math.ceil((hi.y - oy) / D)) + 2
+    for j in range(j_min, j_max + 1):
+        for i in range(i_min, i_max + 1):
+            c = Vector((ox + i * D, oy + j * D))
+            if inside(c.x, c.y):
+                octs[(i, j)] = c
+            m = Vector((ox + (i + 0.5) * D, oy + (j + 0.5) * D))
+            if inside(m.x, m.y):
+                sqs[(i, j)] = m
+    return octs, sqs
+
+
+def oct_random_roads(octs, rng, chance, max_gap, min_gap=0):
+    """Straight roads through octagon centres, along rows and columns. Each row or column is a road with
+    the road chance, and no more than max_gap rows or columns in a row go without one. Returns (edges,
+    degree): the road links, and how many roads meet each octagon."""
+    chosen = {}
+    edges = []
+    degree = {k: 0 for k in octs}
+    for family in (0, 1):
+        lines = set()
+        for key in octs:
+            n = (key[0] + 1, key[1]) if family == 0 else (key[0], key[1] + 1)
+            if n in octs:
+                lines.add(key[1] if family == 0 else key[0])
+        for lk, road in choose_lines(lines, rng, chance, max_gap, min_gap).items():
+            chosen[(family, lk)] = road
+        for key in sorted(octs):
+            n = (key[0] + 1, key[1]) if family == 0 else (key[0], key[1] + 1)
+            if n not in octs:
+                continue
+            line = (family, key[1]) if family == 0 else (family, key[0])
+            if chosen[line]:
+                edges.append((key, n))
+                degree[key] += 1
+                degree[n] += 1
+    return edges, degree
+
+
+HALLWAY_HALF_FT = 6.0                              # the centre hallway through a road octagon is 12 ft wide
+EDGE_HALLWAY_HALF_FT = 6.0                         # the hallway along each octagon edge is 12 ft wide
+
+
+def _clip(poly, n, a, keep_nonneg):
+    """Sutherland-Hodgman clip of a convex polygon to one side of the line through a with normal n."""
+    out = []
+    m = len(poly)
+    for i in range(m):
+        p, q = poly[i], poly[(i + 1) % m]
+        fp = n.dot(p - a) if keep_nonneg else -n.dot(p - a)
+        fq = n.dot(q - a) if keep_nonneg else -n.dot(q - a)
+        if fp >= 0:
+            out.append(p)
+        if (fp >= 0) != (fq >= 0):
+            t = fp / (fp - fq)
+            out.append(p + (q - p) * t)
+    return out
+
+
+def _polygon_area(poly):
+    return abs(sum(poly[i].x * poly[(i + 1) % len(poly)].y - poly[(i + 1) % len(poly)].x * poly[i].y
+                   for i in range(len(poly)))) / 2.0
+
+
+def _subtract_convex(poly, rect):
+    """The parts of a convex polygon that lie outside a convex rectangle (counter-clockwise), as convex polygons."""
+    pieces = []
+    cur = poly
+    for i in range(len(rect)):
+        a, b = rect[i], rect[(i + 1) % len(rect)]
+        d = b - a
+        n = Vector((-d.y, d.x)).normalized()           # inward normal of a counter-clockwise edge
+        outside = _clip(cur, n, a, keep_nonneg=False)
+        if len(outside) >= 3 and _polygon_area(outside) > 1e-6:    # skip slivers that have no area
+            pieces.append(outside)
+        cur = _clip(cur, n, a, keep_nonneg=True)
+        if len(cur) < 3:
+            break
+    return pieces
+
+
+def road_octagon_pieces(c, links, L):
+    """The road octagon of one cell: the octagon with a 20 ft road strip cut out from its centre along each
+    road it connects to, a 12 ft centre hallway across it at right angles to the road, and a 12 ft hallway along each of its two edges that lie across the road. links are the (x, y) steps
+    of those roads. Returns convex pieces."""
+    half_road = L.ROAD_W / 2.0
+    half_hall = HALLWAY_HALF_FT * FT
+    reach = L.APO + 0.1                                    # a little past the edge, so each cut goes all the way through
+    cuts = []
+    for dx, dy in links:
+        u = Vector((dx, dy))
+        cuts.append(rect_poly(c + u * (reach / 2.0), u, reach / 2.0, half_road))
+    half_edge = EDGE_HALLWAY_HALF_FT * FT
+    vertical = any(dx == 0 for dx, dy in links)            # a north-south road
+    horizontal = any(dy == 0 for dx, dy in links)          # an east-west road
+    if vertical and not horizontal:
+        cuts.append(rect_poly(c, Vector((1.0, 0.0)), reach, half_hall))    # centre hallway runs east-west
+        for side in (1.0, -1.0):                                           # edge hallways along the north and south edges
+            cuts.append(rect_poly(c + Vector((0.0, side * L.APO)), Vector((1.0, 0.0)), reach, half_edge))
+    if horizontal and not vertical:
+        cuts.append(rect_poly(c, Vector((0.0, 1.0)), reach, half_hall))    # centre hallway runs north-south
+        for side in (1.0, -1.0):                                           # edge hallways along the east and west edges
+            cuts.append(rect_poly(c + Vector((side * L.APO, 0.0)), Vector((0.0, 1.0)), reach, half_edge))
+    pieces = [oct_ring(c, L.R)]
+    for cut in cuts:
+        nxt = []
+        for piece in pieces:
+            nxt.extend(_subtract_convex(piece, cut))
+        pieces = nxt
+    return pieces
+
+
+def road_blocked_sides(links):
+    """Octagon side indices (0-7, as in the wall loop) that a road or hallway runs through, so no wall there."""
+    index = {(1, 0): 0, (0, 1): 2, (-1, 0): 4, (0, -1): 6}
+    out = set()
+    for dx, dy in links:
+        out.add(index[(dx, dy)])
+        if dy == 0:
+            out |= {2, 6}                                  # east-west road: hallway north-south
+        if dx == 0:
+            out |= {0, 4}                                  # north-south road: hallway east-west
+    return out
+
+
+def road_octagon_record(pool, rng, c, z, height, layer, horizontal, turn=0.0, src=None):
+    """A copy of one Road Octagons object on a road or junction octagon. Its origin sits at the centre of
+    the octagon cell, and it keeps its size. A road running north-south turns it 90 degrees. It is stretched
+    to the road height."""
+    if src is None:
+        src = pool[rng.randrange(len(pool))]
+    kz = height / src["height"] if src["height"] > 0 else 1.0
+    theta = (0.0 if horizontal else math.pi / 2.0) + turn
+    C = Matrix.Translation((-src["c0"].x, -src["c0"].y, -src["zb"]))
+    Sz = Matrix.Diagonal(Vector((1.0, 1.0, kz, 1.0)))
+    T = Matrix.Translation((c.x, c.y, z))
+    return {"group": "Road Octagons", "cat": "roads", "layer": layer, "src": src,
+            "matrix": T @ Matrix.Rotation(theta, 4, 'Z') @ Sz @ C @ src["obj"].matrix_world}
+
+
+def build_octagon_city(p):
+    """The octagon city, as the hexagon one: towers, roads, junctions with elevators, gap squares,
+    walls, roofs and parks. Returns (buckets, stats, records) like build_city."""
+    L = oct_layout(p)
+    fp = footprint_object(p)
+    height_at, lo, hi = mesh_height_tester(fp)
+    inside = lambda x, y: height_at(x, y) is not None
+    rng = random.Random(p.seed)
+    copy_rng = random.Random(p.seed * 7919 + 21)     # picks have their own sequences, so the layout is fixed
+    roof_rng = random.Random(p.seed * 7919 + 22)
+    elev_rng = random.Random(p.seed * 7919 + 23)
+    records = []
+    oct_src = source_pool(p.coll_octagons)
+    sq_src = source_pool(p.coll_squares)
+    roof_src = source_pool(p.coll_roof)
+    wall_src = source_pool(p.coll_walls)
+    park_src = source_pool(p.coll_parks)
+    elev_src = source_pool(p.coll_elevators)
+    road_src = source_pool(p.coll_road_octagons)
+    road_rng = random.Random(p.seed * 7919 + 24)
+
+    octs, sqs = oct_lattice(inside, lo, hi, rng, L)
+    if not octs:
+        raise RuntimeError("No octagons fall inside the footprint.")
+
+    cap = max(1, p.max_layers)
+    plane = None
+    if p.roof_plane is not None and p.roof_plane.type == 'MESH':
+        plane, _, _ = mesh_height_tester(p.roof_plane)
+    hmax = {}
+    for key, c in octs.items():
+        if plane is None:
+            n = cap
+        else:
+            z = plane(c.x, c.y)
+            n = 1 if z is None else layers_under(z, L)
+        hmax[key] = max(1, min(cap, n))
+
+    edges, degree = oct_random_roads(octs, rng, p.road_chance, p.max_cells_between_roads, p.min_cells_between_roads)
+    hubs = {k for k in octs if degree[k] >= 3}              # junctions: transport octagons
+    roads = {k for k in octs if 1 <= degree[k] < 3}          # road octagons
+    towers = {k for k in octs if degree[k] == 0}
+
+    tmin, tmax = sorted((p.tower_min, p.tower_max))
+    tower_heights = {}
+    for key in sorted(towers):
+        tower_heights[key] = min(rng.randint(max(1, tmin), max(1, tmax)), hmax[key])
+    top = dict(hmax)
+    for key, H in tower_heights.items():
+        top[key] = H
+
+    sq_hmax = {}
+    for key, m in sqs.items():
+        if plane is None:
+            n = cap
+        else:
+            z = plane(m.x, m.y)
+            n = 1 if z is None else layers_under(z, L)
+        sq_hmax[key] = max(1, min(cap, n))
+    sq_top = {}
+    for key in sorted(sqs):
+        sq_top[key] = min(rng.randint(max(1, tmin), max(1, tmax)), sq_hmax[key])
+
+    buckets = {}
+
+    def bucket(cat, layer):
+        k = (cat, layer)
+        if k not in buckets:
+            buckets[k] = bmesh.new()
+        return buckets[k]
+
+    P = L.PITCH
+    H_ = L.HEX_H
+
+    # Ground: a tile under every octagon, and a block in every gap square.
+    for key, c in octs.items():
+        if key not in roads and key not in hubs:           # roads have the road octagon instead; intersections are open
+            add_prism(bucket("tiles", 1), oct_ring(c, L.R), TILE_BOT, TILE_TOP)
+    for key, m in sqs.items():
+        add_prism(bucket("squares", 1), square_ring(m, L.EDGE), TILE_BOT, TILE_TOP)
+
+    def roof(c, z0, z1, layer):
+        if roof_src:
+            records.append(poly_record(roof_src, roof_rng, c, z0, z1 - z0, layer, L.APO, 8, 0.0, "Roof", "roofs"))
+        else:
+            add_prism(bucket("roofs", layer), oct_ring(c, L.R), z0, z1)
+
+    # Towers: a module on each level, a roof above each module.
+    if p.show_towers:
+        for key in sorted(towers):
+            c = octs[key]
+            for k in range(tower_heights[key] - 1):
+                z = TILE_TOP + k * P
+                if oct_src:
+                    records.append(poly_record(oct_src, copy_rng, c, z, H_, k + 1, L.APO, 8, 0.0,
+                                               "Octagons", "towers"))
+                else:
+                    add_prism(bucket("towers", k + 1), oct_ring(c, L.R), z, z + H_)
+                roof(c, z + H_, z + P, k + 2)
+
+    # Gap squares: a module on each level above the ground block, and a roof above each module.
+    def sq_roof(m, z0, z1, layer):
+        if roof_src:
+            records.append(poly_record(roof_src, roof_rng, m, z0, z1 - z0, layer, L.EDGE / 2.0, 4, 45.0,
+                                       "Roof", "roofs"))
+        else:
+            add_prism(bucket("roofs", layer), square_ring(m, L.EDGE), z0, z1)
+
+    if p.show_squares:
+        for key in sorted(sqs):
+            m = sqs[key]
+            for k in range(sq_top[key] - 1):
+                z = TILE_TOP + k * P
+                if sq_src:
+                    records.append(poly_record(sq_src, copy_rng, m, z, H_, k + 1, L.EDGE / 2.0, 4, 45.0,
+                                               "Squares", "squares"))
+                else:
+                    add_prism(bucket("squares", k + 1), square_ring(m, L.EDGE), z, z + H_)
+                sq_roof(m, z + H_, z + P, k + 2)
+
+    # Road octagons and junctions: floors and roofs, as the hexagon ground cells.
+    for key in sorted(roads | hubs):
+        c = octs[key]
+        base = ROAD_BASE if key in roads else TILE_TOP
+        for k in range(hmax[key] - 1):
+            z = base + k * P
+            roof(c, z + H_, z + P, k + 2)
+
+    # Roads. With Road Octagons picked, each road octagon gets a copy, one per level. Without it, each one is an
+    # octagon with a hallway through its centre along each road it connects to. Transport octagons (intersections)
+    # get only the road strips and elevators, no road octagon.
+    links = {}
+    for a, b in edges:
+        d = (b[0] - a[0], b[1] - a[1])
+        links.setdefault(a, []).append(d)
+        links.setdefault(b, []).append((-d[0], -d[1]))
+    horizontal = set()
+    for a, b in edges:
+        if a[1] == b[1]:                                   # the two octagons share a row, so the road runs east-west
+            horizontal.update((a, b))
+    if p.show_roads:
+        for key in sorted(roads | hubs):
+            c = octs[key]
+            dirs = links.get(key, [])
+            for k in range(max(1, hmax[key] - 1)):
+                z = ROAD_BASE + k * P
+                for dx, dy in dirs:                       # the 20 ft road, from the centre out to each side it leaves
+                    u = Vector((dx, dy))
+                    add_prism(bucket("roads", k + 1), rect_poly(c + u * (L.APO / 2.0), u, L.APO / 2.0, L.ROAD_W / 2.0),
+                              z, z + ROAD_H)
+                if key not in roads:                      # a transport octagon is an intersection: no road octagon in it
+                    continue
+                if road_src:
+                    # Two copies per road cell, 180 degrees apart about the cell centre, from the same object.
+                    pick = road_src[road_rng.randrange(len(road_src))]
+                    for turn in (0.0, math.pi):
+                        records.append(road_octagon_record(road_src, road_rng, c, z, H_, k + 1, key in horizontal,
+                                                           turn, pick))
+                else:
+                    for piece in road_octagon_pieces(c, dirs, L):
+                        add_prism(bucket("road_octagons", k + 1), piece, z, z + H_)
+
+    # Elevators: one per level in every junction.
+    if p.show_elevators:
+        elev_h = ELEVATOR_H_FT * FT
+        shaft_s = L.EDGE / OCT_EDGE_DEFAULT                 # shafts shrink and grow in X and Y with the edge length
+        for key in sorted(hubs):
+            c = octs[key]
+            for k in range(hmax[key]):
+                z = TILE_TOP + k * P
+                if elev_src:
+                    records.append(elevator_record(elev_src, elev_rng, c, z, elev_h, k + 1, shaft_s))
+                else:
+                    for dx, dy in OCT_SHAFT_OFFSETS_FT:
+                        centre = c + Vector((dx * FT * shaft_s, dy * FT * shaft_s))
+                        add_prism(bucket("elevators", k + 1), square_ring(centre, OCT_SHAFT_FT * FT * shaft_s), z, z + elev_h)
+
+    # Columns: a 3 ft octagonal column at every octagon corner, one per level of the stack on that corner.
+    # Each column is one level plus one roof tall (36 ft). Corners shared by octagons take the taller stack.
+    column_count = 0
+    if p.show_columns:
+        col_r = 1.5 * FT / math.cos(math.radians(22.5))      # octagon 3 ft wide, flat side to flat side
+        col_site = {}                                        # rounded (x, y) -> (point, layers, base z)
+        for key, c in octs.items():
+            layers = top[key]
+            base = ROAD_BASE if key in roads else TILE_TOP
+            for v in oct_ring(c, L.R):
+                site = (round(v.x, 3), round(v.y, 3))
+                if site not in col_site or col_site[site][1] < layers:
+                    col_site[site] = (v, layers, base)
+        for v, layers, base in col_site.values():
+            column_count += 1
+            column = oct_ring(v, col_r)
+            for k in range(max(0, layers - 1)):
+                add_prism(bucket("columns", k + 1), column, base + k * P, base + (k + 1) * P)
+
+    # Walls: on every side that is exposed, octagons and squares alike. A side is exposed where the cell
+    # across it is shorter, as in the hexagon city.
+    walls = 0
+
+    def side_walls(c, ang, reach, tb, ta):
+        """Walls on one side of a cell, from the level above the neighbour up to the cell's top."""
+        n = Vector((math.cos(math.radians(ang)), math.sin(math.radians(ang))))
+        centre = c + n * (reach + L.WALL_T / 2.0)
+        tangent = Vector((-n.y, n.x))
+        count = 0
+        for k in range(max(tb - 1, 0), ta - 1):
+            z = TILE_TOP + k * P
+            if wall_src:
+                records.append(wall_record(wall_src, copy_rng, centre, ang, z, H_, k + 1, L,
+                                           length=L.EDGE, thick=L.WALL_T))
+            else:
+                add_prism(bucket("walls", k + 1), rect_poly(centre, tangent, L.EDGE / 2.0, L.WALL_T / 2.0),
+                          z, z + H_)
+            count += 1
+        return count
+
+    if p.show_walls:
+        for key in sorted(octs):
+            ta = top[key]
+            blocked = road_blocked_sides(links.get(key, [])) if (key in roads or key in hubs) else set()
+            for side in range(8):
+                if side in blocked:
+                    continue
+                if side % 2 == 0:
+                    da, db = OCT_AXIAL[side]
+                    tb = top.get((key[0] + da, key[1] + db), 0)
+                else:
+                    da, db = OCT_DIAG_SQUARE[side]
+                    tb = sq_top.get((key[0] + da, key[1] + db), 0)
+                if tb >= ta:
+                    continue
+                walls += side_walls(octs[key], 45.0 * side, L.APO, tb, ta)
+        if p.show_squares:
+            for key in sorted(sqs):
+                ts = sq_top[key]
+                for ang, (da, db) in SQ_SIDE_OCT.items():
+                    tb = top.get((key[0] + da, key[1] + db), 0)
+                    if tb >= ts:
+                        continue
+                    walls += side_walls(sqs[key], ang, L.EDGE / 2.0, tb, ts)
+
+    # Parks on the top level of each tower, road octagon (two levels or more), junction and gap square.
+    parks = 0
+    tree_count = 0
+    bench_count = 0
+    placed_oct = []                                                 # octagon park cells: (centre, layer, slab height, base z)
+    path_rng = random.Random(p.seed * 7919 + 25)                    # its own sequence, so other parks do not move
+    if p.show_parks:
+        L_sq = SimpleNamespace(**{**vars(L), "APO": L.EDGE / 2.0})   # trees and benches fit a square
+        sites = []                                                  # (centre, top layer, base z, is a square)
+        for key in sorted(octs):
+            if key in towers:
+                sites.append((octs[key], top[key], TILE_TOP, False))
+            elif key in roads:
+                if hmax[key] >= 2:
+                    sites.append((octs[key], hmax[key], ROAD_BASE, False))
+            else:
+                sites.append((octs[key], hmax[key], TILE_TOP, False))
+        if p.show_squares:
+            for key in sorted(sqs):
+                sites.append((sqs[key], sq_top[key], TILE_TOP, True))
+        for c, Hp, zb, is_sq in sites:
+            if rng.random() > p.park_density:
+                continue
+            z_base = zb + (Hp - 1) * P
+            if park_src:
+                src = park_src[copy_rng.randrange(len(park_src))]
+                th = copy_rng.randrange(8) * math.tau / 8.0
+                records.append(park_record(src, [c], th, z_base, Hp))
+                slab_h = src["height"]
+            else:
+                ring = square_ring(c, L.EDGE) if is_sq else oct_ring(c, L.R)
+                add_prism(bucket("parks", Hp), ring, z_base, z_base + PARK_SLAB_H)
+                slab_h = PARK_SLAB_H
+            if not is_sq:
+                placed_oct.append((c, Hp, slab_h, z_base))
+            Lc = L_sq if is_sq else L
+            trees = tree_spots(c, p.trees_per_cell, rng, Lc) if p.show_trees else []
+            for pos, sc in trees:
+                add_tree(bucket("trunks", Hp), bucket("canopies", Hp), pos, z_base + slab_h, sc, Lc)
+                tree_count += 1
+            if p.show_benches:
+                for pos, th_b in bench_spots(c, p.benches_per_cell, trees, rng, Lc):
+                    add_bench(bucket("benches", Hp), pos, th_b, z_base + slab_h, Lc)
+                    bench_count += 1
+            parks += 1
+
+    # Roof paths: on every octagon park cell, joined to the park cell across each axial side that also has one.
+    if p.show_paths and placed_oct:
+        path_z = {}
+        for c, Hp, slab, zb_ in placed_oct:
+            path_z[(Hp, round(c.x, 1), round(c.y, 1))] = zb_ + slab + PATH_LIFT_FT * FT
+        for c, Hp, slab, zb_ in placed_oct:
+            z_path = zb_ + slab + PATH_LIFT_FT * FT
+            sides = []
+            for m, (dx, dy) in ((0, (1, 0)), (2, (0, 1)), (4, (-1, 0)), (6, (0, -1))):
+                nb = c + Vector((dx, dy)) * L.D
+                zn = path_z.get((Hp, round(nb.x, 1), round(nb.y, 1)))
+                if zn is not None and abs(zn - z_path) < 1e-6:
+                    sides.append(m)
+            add_oct_path(bucket("paths", Hp), c, z_path, path_rng, L, sides)
+
+    # Cells for the Stats box: every level of every octagon except junctions, less the top (park) level.
+    cells_counted = sum(max(0, hmax[key] - 1) for key in octs if key not in hubs)
+    if p.show_squares:
+        cells_counted += sum(max(0, sq_hmax[key] - 1) for key in sqs)
+    stats = {
+        "footprint": len(octs),
+        "squares": len(sqs),
+        "cells_counted": cells_counted,
+        "hexes": len(octs),
+        "towers": len(towers),
+        "transport": len(hubs),
+        "walls": walls,
+        "parks": parks,
+        "trees": tree_count,
+        "benches": bench_count,
+        "top_layer": max(hmax.values()),
+    }
+    stats["copies"] = len(records)
+    return buckets, stats, records
+
+
 # ---------------------------------------------------------------------------
 # Output objects
 # ---------------------------------------------------------------------------
@@ -1185,20 +1838,32 @@ def bmesh_normals(me):
 
 
 def rebuild(scene):
-    """Clears the old proxy city and builds it again from the current slider values."""
-    p = scene.arcology_props
+    """Clears the old proxy city and builds the city of the tab showing, from that tab's slider values."""
+    hexp = scene.arcology_props                  # also holds the shared Live switch and status line
     t0 = time.perf_counter()
-    buckets, stats, records = build_city(p)
-    p.last_footprint = stats["hexes"]
-    p.last_hex_count = stats["cells_counted"]           # every level except transport hexes and the park layer
+    if scene.arcology_shape == SHAPE_RECT:
+        hexp.status = "Rectangle is under construction"
+        return None
+    if scene.arcology_shape == SHAPE_OCT:
+        q = scene.arcology_octagon
+        buckets, stats, records = build_octagon_city(q)
+        q.last_footprint = stats["footprint"]
+        q.last_cell_count = stats["cells_counted"]    # every level except junctions and the park layer
+        summary = (f"{stats['footprint']} octagons, {stats['squares']} squares, top layer {stats['top_layer']}, "
+                   f"{stats['towers']} towers, {stats['walls']} walls, {stats['parks']} park cells, "
+                   f"{stats['trees']} trees, {stats['benches']} benches")
+    else:
+        buckets, stats, records = build_city(hexp)
+        hexp.last_footprint = stats["hexes"]
+        hexp.last_hex_count = stats["cells_counted"]      # every level except transport hexes and the park layer
+        summary = (f"{stats['hexes']} hexes, top layer {stats['top_layer']}, "
+                   f"{stats['towers']} towers, {stats['walls']} walls, {stats['parks']} park cells, "
+                   f"{stats['trees']} trees, {stats['benches']} benches")
     clear_output(prune=False)
     n_objects = write_output(scene, buckets) + write_copies(scene, records)
     prune_output_collections()
     dt = (time.perf_counter() - t0) * 1000.0
-    p.status = (f"{stats['hexes']} hexes, top layer {stats['top_layer']}, "
-                f"{stats['towers']} towers, {stats['walls']} walls, {stats['parks']} park cells, "
-                f"{stats['trees']} trees, {stats['benches']} benches, "
-                f"{n_objects} objects, {dt:.0f} ms")
+    hexp.status = f"{summary}, {n_objects} objects, {dt:.0f} ms"
     return stats
 
 
@@ -1228,9 +1893,19 @@ def schedule_rebuild(delay=0.15):
     bpy.app.timers.register(_timer_fire, first_interval=delay)
 
 
-def _on_change(self, context):
-    if self.live:
+def _auto_rebuild(shape):
+    """Schedules a live rebuild, but only when the tab for this shape is the one showing."""
+    scene = bpy.context.scene
+    if scene is not None and scene.arcology_props.live and scene.arcology_shape == shape:
         schedule_rebuild()
+
+
+def _on_change(self, context):
+    _auto_rebuild(SHAPE_HEX)
+
+
+def _on_oct_change(self, context):
+    _auto_rebuild(SHAPE_OCT)
 
 
 # ---------------------------------------------------------------------------
@@ -1298,12 +1973,24 @@ class ArcologyProps(PropertyGroup):
         get=lambda self: self.roof_ft * (1.0 if self.size_in_feet else FT),
         set=lambda self, value: _set_height_shown(self, "roof_ft", value, 0.5, 20.0),
         description="Height of the roof slab. Shown in the unit picked by the button beside Size")
+    road_width_ft: FloatProperty(name="Road width (ft)", default=20.0, min=6.0, max=60.0, update=_on_change)
+    road_width_shown: FloatProperty(
+        name="Road width", precision=2, min=1.8, max=18.0, update=_on_change,
+        get=lambda self: self.road_width_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "road_width_ft", value, 6.0, 60.0),
+        description="Width of a road. Shown in the unit picked by the button beside Size")
     max_layers: IntProperty(name="Max layers", default=12, min=1, max=24, update=_on_change,
                             description="The most layers any hex can have")
     tower_min: IntProperty(name="Tower min layers", default=10, min=1, max=24, update=_on_change)
     tower_max: IntProperty(name="Tower max layers", default=12, min=1, max=24, update=_on_change)
     road_chance: FloatProperty(name="Road chance", default=0.12, min=0.0, max=1.0, subtype='FACTOR',
                                update=_on_change, description="Chance that a straight line of hexes is a road")
+    max_cells_between_roads: IntProperty(
+        name="Max Cells Between Roads", default=3, min=1, max=12, update=_on_change,
+        description="The most rows or columns of hexes that can sit between two roads. A road is forced when reached")
+    min_cells_between_roads: IntProperty(
+        name="Min Cells Between Roads", default=1, min=0, max=12, update=_on_change,
+        description="The fewest rows or columns of hexes that must sit between two roads, so roads are never back to back")
     park_density: FloatProperty(name="Park density", default=0.8, min=0.0, max=1.0, subtype='FACTOR',
                                 update=_on_change, description="Chance that a roof site gets a park")
     show_towers: BoolProperty(name="Towers", default=True, update=_on_change)
@@ -1359,6 +2046,120 @@ class ArcologyProps(PropertyGroup):
     status: bpy.props.StringProperty(name="Status", default="Not built yet")
 
 
+def _set_oct_edge_shown(props, value):
+    """Store the typed or dragged octagon edge in metres, clamped to 5 to 80 m."""
+    metres = value * (FT if props.size_in_feet else 1.0)
+    props["oct_edge"] = min(max(metres, 5.0), 80.0)
+
+
+class OctagonProps(PropertyGroup):
+    """Settings for the octagon city. Kept apart from the hexagon settings, so each city has its own values."""
+    footprint: PointerProperty(
+        name="Footprint", type=bpy.types.Object, poll=_is_mesh, update=_on_oct_change,
+        description="The mesh the octagon city is built on. Leave empty to use 'Ark Polygon' or '30 Acre Ark'")
+    roof_plane: PointerProperty(
+        name="Roof Plane", type=bpy.types.Object, poll=_is_mesh, update=_on_oct_change,
+        description="Optional. Its height above each octagon sets that octagon's layer count, so it can be sculpted")
+    seed: IntProperty(name="Seed", default=42, min=0, max=999999, update=_on_oct_change)
+    oct_edge: FloatProperty(name="Octagon edge length", default=33.35 / math.sqrt(3.0), min=5.0, max=80.0,
+                            update=_on_oct_change,
+                            description="Length of one side of an octagon, in metres. The gap squares have the same side")
+    size_in_feet: BoolProperty(name="Feet", default=False,
+                               description="Show the octagon edge length and heights in feet instead of meters")
+    oct_edge_shown: FloatProperty(
+        name="Octagon edge length", precision=2, min=0.5, max=300.0, update=_on_oct_change,
+        get=lambda self: self.oct_edge / (FT if self.size_in_feet else 1.0),
+        set=lambda self, value: _set_oct_edge_shown(self, value),
+        description="Length of one side of an octagon. Shown in the unit picked by the button beside Size")
+    level_ft: FloatProperty(name="Level height (ft)", default=30.0, min=8.0, max=60.0, update=_on_oct_change)
+    roof_ft: FloatProperty(name="Roof height (ft)", default=6.0, min=0.5, max=20.0, update=_on_oct_change)
+    level_shown: FloatProperty(
+        name="Level height", precision=2, min=2.0, max=60.0, update=_on_oct_change,
+        get=lambda self: self.level_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "level_ft", value, 8.0, 60.0),
+        description="Height of one level. Shown in the unit picked by the button beside Size")
+    roof_shown: FloatProperty(
+        name="Roof height", precision=2, min=0.15, max=20.0, update=_on_oct_change,
+        get=lambda self: self.roof_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "roof_ft", value, 0.5, 20.0),
+        description="Height of the roof slab. Shown in the unit picked by the button beside Size")
+    road_width_ft: FloatProperty(name="Road width (ft)", default=20.0, min=6.0, max=60.0, update=_on_oct_change)
+    road_width_shown: FloatProperty(
+        name="Road width", precision=2, min=1.8, max=18.0, update=_on_oct_change,
+        get=lambda self: self.road_width_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "road_width_ft", value, 6.0, 60.0),
+        description="Width of a road. Shown in the unit picked by the button beside Size")
+    max_layers: IntProperty(name="Max layers", default=12, min=1, max=24, update=_on_oct_change,
+                            description="The most layers any octagon or square can have")
+    tower_min: IntProperty(name="Tower min layers", default=10, min=1, max=24, update=_on_oct_change)
+    tower_max: IntProperty(name="Tower max layers", default=12, min=1, max=24, update=_on_oct_change)
+    road_chance: FloatProperty(name="Road chance", default=0.12, min=0.0, max=1.0, subtype='FACTOR',
+                               update=_on_oct_change,
+                               description="Chance that a row or column of octagons is a road")
+    max_cells_between_roads: IntProperty(
+        name="Max Cells Between Roads", default=3, min=1, max=12, update=_on_oct_change,
+        description="The most rows or columns of octagons that can sit between two roads. A road is forced when reached")
+    min_cells_between_roads: IntProperty(
+        name="Min Cells Between Roads", default=1, min=0, max=12, update=_on_oct_change,
+        description="The fewest rows or columns of octagons that must sit between two roads, so roads are never back to back")
+    park_density: FloatProperty(name="Park density", default=0.8, min=0.0, max=1.0, subtype='FACTOR',
+                                update=_on_oct_change, description="Chance that a roof site gets a park")
+    show_towers: BoolProperty(name="Towers", default=True, update=_on_oct_change)
+    show_roads: BoolProperty(name="Roads", default=True, update=_on_oct_change)
+    show_squares: BoolProperty(name="Squares", default=True, update=_on_oct_change,
+                               description="Square towers in the gaps between the octagons")
+    show_parks: BoolProperty(name="Parks", default=True, update=_on_oct_change)
+    show_elevators: BoolProperty(name="Elevators", default=True, update=_on_oct_change)
+    show_walls: BoolProperty(name="Walls", default=True, update=_on_oct_change)
+    show_trees: BoolProperty(name="Trees", default=True, update=_on_oct_change)
+    show_benches: BoolProperty(name="Benches", default=True, update=_on_oct_change)
+    show_columns: BoolProperty(name="Columns", default=True, update=_on_oct_change,
+                               description="3 ft columns at every octagon corner, one 36 ft column per level")
+    show_paths: BoolProperty(name="Paths", default=True, update=_on_oct_change,
+                             description="4 ft roof paths on the park cells, six flat planes per cell, joined to neighbours")
+    coll_octagons: PointerProperty(
+        name="Octagons", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied to fill the octagon towers. Empty = generated octagons")
+    coll_road_octagons: PointerProperty(
+        name="Road Octagons", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied onto the road and junction octagons, at road height. "
+                    "The road runs along the object's X axis. Empty = generated road strips")
+    coll_squares: PointerProperty(
+        name="Squares", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied to fill the square towers. Empty = generated squares")
+    coll_parks: PointerProperty(
+        name="Parks", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied onto the roofs as parks. Empty = generated parks")
+    coll_walls: PointerProperty(
+        name="Walls", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied onto the exposed sides as walls. Empty = generated walls")
+    coll_roof: PointerProperty(
+        name="Roof", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied onto the roofs. Empty = generated roofs")
+    coll_elevators: PointerProperty(
+        name="Elevators", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied into the transport octagons. Empty = generated shafts")
+    trees_per_cell: IntProperty(name="Trees per park octagon", default=5, min=0, max=30, update=_on_oct_change,
+                                description="Random trees placed in each park octagon")
+    benches_per_cell: IntProperty(name="Benches per park octagon", default=2, min=0, max=30, update=_on_oct_change,
+                                  description="Random benches placed in each park octagon")
+    last_cell_count: IntProperty(name="Octagon cells", default=0,
+                                 description="Octagon cells in the last build, counted at every level, excluding junctions and the park layer (set by Build)")
+    last_footprint: IntProperty(name="Footprint octagons", default=0,
+                                description="Octagons across the footprint in the last build (set by Build)")
+    stat_residential: FloatProperty(name="Percent Residential", default=0.6, min=0.0, max=1.0, precision=2,
+                                    description="Share of octagon cells that are residential, from 0 to 1")
+    stat_residents: IntProperty(name="Residents per octagon", default=20, min=0,
+                                description="Residents in each residential octagon cell")
+    stat_cost: FloatProperty(name="Cost Per Octagon ($M)", default=2.0, min=0.0, precision=2,
+                             description="Build cost of one octagon cell, in millions of dollars")
+    stat_household: FloatProperty(name="Persons Per Household", default=2.6, min=0.1, max=20.0, precision=1,
+                                  description="Average number of people in each household")
+    stat_mortgage_rate: FloatProperty(name="Mortgage Rate", default=7.0, min=0.0, max=30.0, precision=2,
+                                      subtype='PERCENTAGE',
+                                      description="Annual mortgage interest rate. The loan is a 30-year fixed mortgage")
+
+
 class ARCOLOGY_OT_rebuild(Operator):
     bl_idname = "arcology.rebuild"
     bl_label = "Rebuild"
@@ -1390,7 +2191,9 @@ class ARCOLOGY_OT_reseed(Operator):
     bl_description = "Pick a random seed"
 
     def execute(self, context):
-        context.scene.arcology_props.seed = random.randint(0, 999999)
+        scene = context.scene
+        props = scene.arcology_octagon if scene.arcology_shape == SHAPE_OCT else scene.arcology_props
+        props.seed = random.randint(0, 999999)
         return {'FINISHED'}
 
 
@@ -1402,6 +2205,19 @@ COLLECTION_INFO = (
     "Elevators: put the origin at the centre of the transport hex cell it sits in. One copy replaces all six shafts.",
     "Road Trapezoids: put the origin at the centre of the hex cell it sits in.",
     "Parks: put the origin at the centre of the park's first hex cell.",
+    "Wall exteriors must be facing west, and wall lengths must be facing North/South.",
+    "Heights come from each object's lowest point, so origin height does not matter.",
+)
+
+OCT_COLLECTION_INFO = (
+    "Where the origin of your objects matters:",
+    "",
+    "Octagons: no origin needed. The add-on uses each object's bounding box.",
+    "Road Octagons: put the origin at the centre of the octagon cell. The road runs east-west along the object's X axis, and is turned 90 degrees for a north-south road.",
+    "Squares: no origin needed. Each copy fills one level of a square tower.",
+    "Roof: no origin needed. The add-on uses each object's bounding box.",
+    "Parks: put the origin at the centre of the octagon it sits on.",
+    "Elevators: put the origin at the centre of the transport octagon. One copy holds all eight shafts.",
     "Wall exteriors must be facing west, and wall lengths must be facing North/South.",
     "Heights come from each object's lowest point, so origin height does not matter.",
 )
@@ -1481,15 +2297,213 @@ class ARCOLOGY_OT_collection_info(Operator):
 
     def draw(self, context):
         col = self.layout.column(align=True)
-        for line in COLLECTION_INFO:
+        lines = OCT_COLLECTION_INFO if context.scene.arcology_shape == SHAPE_OCT else COLLECTION_INFO
+        for line in lines:
             col.label(text=line)
 
     def execute(self, context):
         return {'FINISHED'}
 
 
+def _draw_oct(layout, q):
+    """The octagon tab. Same layout as the hexagon tab, with its own values."""
+    unit = "ft" if q.size_in_feet else "m"
+    box = layout.box()
+    row = box.row()
+    row.label(text="Footprint and roof")
+    row.operator("arcology.info", text="", icon='INFO').text = FOOTPRINT_INFO
+    box.prop(q, "footprint")
+    box.prop(q, "roof_plane")
+
+    box = layout.box()
+    row = box.row()
+    row.label(text="Collections")
+    row.operator("arcology.collection_info", text="", icon='INFO')
+    box.prop(q, "coll_octagons")
+    box.prop(q, "coll_road_octagons")
+    box.prop(q, "coll_squares")
+    box.prop(q, "coll_parks")
+    box.prop(q, "coll_walls")
+    box.prop(q, "coll_roof")
+    box.prop(q, "coll_elevators")
+
+    box = layout.box()
+    row = box.row()
+    row.label(text="Size")
+    row.prop(q, "size_in_feet", text="ft" if q.size_in_feet else "m", toggle=True)
+    box.prop(q, "oct_edge_shown", text=f"Octagon edge length ({unit})")
+    box.prop(q, "level_shown", text=f"Level height ({unit})")
+    box.prop(q, "roof_shown", text=f"Roof height ({unit})")
+    box.prop(q, "road_width_shown", text=f"Road width ({unit})")
+
+    box = layout.box()
+    box.label(text="Height")
+    box.prop(q, "max_layers")
+    box.prop(q, "tower_min")
+    box.prop(q, "tower_max")
+
+    box = layout.box()
+    box.label(text="Roads and seed")
+    row = box.row(align=True)
+    row.prop(q, "seed")
+    row.operator("arcology.reseed", text="", icon='FILE_REFRESH')
+    box.prop(q, "road_chance")
+    box.prop(q, "max_cells_between_roads")
+    box.prop(q, "min_cells_between_roads")
+
+    box = layout.box()
+    box.label(text="Show")
+    grid = box.grid_flow(columns=2, align=True)
+    grid.prop(q, "show_towers")
+    grid.prop(q, "show_roads")
+    grid.prop(q, "show_squares")
+    grid.prop(q, "show_parks")
+    grid.prop(q, "show_elevators")
+    grid.prop(q, "show_walls")
+    grid.prop(q, "show_trees")
+    grid.prop(q, "show_benches")
+    grid.prop(q, "show_columns")
+    grid.prop(q, "show_paths")
+    box.prop(q, "park_density")
+    box.prop(q, "trees_per_cell")
+    box.prop(q, "benches_per_cell")
+
+    box = layout.box()
+    box.label(text="Stats")
+    cells = q.last_cell_count
+    if cells:
+        box.label(text=f"Cells, octagons and squares (every layer, excluding junctions and parks): {cells:,}")
+    else:
+        box.label(text="Cells, octagons and squares (every layer, excluding junctions and parks): build to count")
+    box.prop(q, "stat_residential")
+    box.prop(q, "stat_residents")
+    box.prop(q, "stat_cost")
+    population = cells * q.stat_residential * q.stat_residents
+    cost_m = cells * q.stat_cost
+    cost_text = f"${cost_m:,.1f} M" if cost_m < 1000 else f"${cost_m / 1000:,.2f} B"
+    box.label(text=f"Estimated Population: {population:,.0f}")
+    box.label(text=f"Estimated Cost: {cost_text}")
+    if q.last_footprint:
+        # Land area: each footprint octagon with its share of the gap squares, a cell of side D = edge (1 + sqrt 2)
+        D = q.oct_edge * (1.0 + SQRT2)
+        land_m2 = q.last_footprint * D * D
+        acres = land_m2 / 4046.8564224
+        sq_miles = land_m2 / 2589988.11
+        pop_per_sq_mile = population / sq_miles if sq_miles > 0 else 0.0
+        box.label(text=f"Estimated Land Area: {acres:,.2f} acres")
+        box.label(text=f"Population / square mile: {pop_per_sq_mile:,.0f}")
+        box.label(text=f"Density Compared to Manhattan: {pop_per_sq_mile / MANHATTAN_DENSITY:,.2f}x")
+    else:
+        box.label(text="Estimated Land Area: build to calculate")
+    box.prop(q, "stat_household")
+    box.prop(q, "stat_mortgage_rate")
+    households_per_cell = q.stat_residents / q.stat_household if q.stat_household > 0 else 0.0
+    cost_per_household = (q.stat_cost * 1_000_000.0) / households_per_cell if households_per_cell > 0 else 0.0
+    payment = monthly_mortgage_payment(cost_per_household, q.stat_mortgage_rate)
+    box.label(text=f"Cost per household: ${cost_per_household:,.0f}")
+    box.label(text=f"Estimated Mortgage Payment: ${payment:,.0f} / month")
+
+
+def _draw_hex(layout, p):
+    """The hexagon tab: the settings it has always had."""
+    box = layout.box()
+    row = box.row()
+    row.label(text="Footprint and roof")
+    row.operator("arcology.info", text="", icon='INFO').text = FOOTPRINT_INFO
+    box.prop(p, "footprint")
+    box.prop(p, "roof_plane")
+
+    box = layout.box()
+    row = box.row()
+    row.label(text="Collections")
+    row.operator("arcology.collection_info", text="", icon='INFO')
+    box.prop(p, "coll_hexagons")
+    box.prop(p, "coll_trapezoids")
+    box.prop(p, "coll_parks")
+    box.prop(p, "coll_walls")
+    box.prop(p, "coll_roof")
+    box.prop(p, "coll_elevators")
+
+    box = layout.box()
+    row = box.row()
+    row.label(text="Size")
+    row.prop(p, "size_in_feet", text="ft" if p.size_in_feet else "m", toggle=True)
+    unit = "ft" if p.size_in_feet else "m"
+    box.prop(p, "hex_edge_shown", text=f"Hex edge length ({unit})")
+    box.prop(p, "level_shown", text=f"Level height ({unit})")
+    box.prop(p, "roof_shown", text=f"Roof height ({unit})")
+    box.prop(p, "road_width_shown", text=f"Road width ({unit})")
+
+    box = layout.box()
+    box.label(text="Height")
+    box.prop(p, "max_layers")
+    box.prop(p, "tower_min")
+    box.prop(p, "tower_max")
+
+    box = layout.box()
+    box.label(text="Roads and seed")
+    row = box.row(align=True)
+    row.prop(p, "seed")
+    row.operator("arcology.reseed", text="", icon='FILE_REFRESH')
+    box.prop(p, "road_chance")
+    box.prop(p, "max_cells_between_roads")
+    box.prop(p, "min_cells_between_roads")
+
+    box = layout.box()
+    box.label(text="Show")
+    grid = box.grid_flow(columns=2, align=True)
+    grid.prop(p, "show_towers")
+    grid.prop(p, "show_roads")
+    grid.prop(p, "show_trapezoids")
+    grid.prop(p, "show_parks")
+    grid.prop(p, "show_elevators")
+    grid.prop(p, "show_walls")
+    grid.prop(p, "show_trees")
+    grid.prop(p, "show_benches")
+    grid.prop(p, "show_columns")
+    grid.prop(p, "show_paths")
+    box.prop(p, "park_density")
+    box.prop(p, "trees_per_cell")
+    box.prop(p, "benches_per_cell")
+
+    box = layout.box()
+    box.label(text="Stats")
+    cells = p.last_hex_count
+    if cells:
+        box.label(text=f"Hexagon cells (every layer, excluding transport and parks): {cells:,}")
+    else:
+        box.label(text="Hexagon cells (every layer, excluding transport and parks): rebuild to count")
+    box.prop(p, "stat_residential")
+    box.prop(p, "stat_residents")
+    box.prop(p, "stat_cost")
+    population = cells * p.stat_residential * p.stat_residents
+    cost_m = cells * p.stat_cost
+    cost_text = f"${cost_m:,.1f} M" if cost_m < 1000 else f"${cost_m / 1000:,.2f} B"
+    box.label(text=f"Estimated Population: {population:,.0f}")
+    box.label(text=f"Estimated Cost: {cost_text}")
+    if p.last_footprint:
+        # Land area: the footprint hexagons, each with area (3*sqrt(3)/2) * edge^2 (edge in meters)
+        land_m2 = p.last_footprint * (3.0 * math.sqrt(3.0) / 2.0) * p.hex_edge ** 2
+        acres = land_m2 / 4046.8564224
+        sq_miles = land_m2 / 2589988.11
+        pop_per_sq_mile = population / sq_miles if sq_miles > 0 else 0.0
+        box.label(text=f"Estimated Land Area: {acres:,.2f} acres")
+        box.label(text=f"Population / square mile: {pop_per_sq_mile:,.0f}")
+        box.label(text=f"Density Compared to Manhattan: {pop_per_sq_mile / MANHATTAN_DENSITY:,.2f}x")
+    else:
+        box.label(text="Estimated Land Area: rebuild to calculate")
+    box.prop(p, "stat_household")
+    box.prop(p, "stat_mortgage_rate")
+    # Cost per household: the hexagon cost divided by (residents per hexagon / persons per household)
+    households_per_hex = p.stat_residents / p.stat_household if p.stat_household > 0 else 0.0
+    cost_per_household = (p.stat_cost * 1_000_000.0) / households_per_hex if households_per_hex > 0 else 0.0
+    payment = monthly_mortgage_payment(cost_per_household, p.stat_mortgage_rate)
+    box.label(text=f"Cost per household: ${cost_per_household:,.0f}")
+    box.label(text=f"Estimated Mortgage Payment: ${payment:,.0f} / month")
+
+
 class ARCOLOGY_PT_panel(Panel):
-    bl_label = "Hex Arcology"
+    bl_label = "Arcology"
     bl_idname = "ARCOLOGY_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -1497,108 +2511,25 @@ class ARCOLOGY_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        p = context.scene.arcology_props
+        scene = context.scene
+        p = scene.arcology_props
 
         row = layout.row(align=True)
-        row.operator("arcology.rebuild", icon='FILE_REFRESH')
+        row.operator("arcology.rebuild", text="Build", icon='FILE_REFRESH')
         row.operator("arcology.clear", text="", icon='X')
         layout.prop(p, "live")
         layout.label(text=p.status)
+        layout.prop(scene, "arcology_shape", expand=True)
 
-        box = layout.box()
-        row = box.row()
-        row.label(text="Footprint and roof")
-        row.operator("arcology.info", text="", icon='INFO').text = FOOTPRINT_INFO
-        box.prop(p, "footprint")
-        box.prop(p, "roof_plane")
-
-        box = layout.box()
-        row = box.row()
-        row.label(text="Collections")
-        row.operator("arcology.collection_info", text="", icon='INFO')
-        box.prop(p, "coll_hexagons")
-        box.prop(p, "coll_trapezoids")
-        box.prop(p, "coll_parks")
-        box.prop(p, "coll_walls")
-        box.prop(p, "coll_roof")
-        box.prop(p, "coll_elevators")
-
-        box = layout.box()
-        row = box.row()
-        row.label(text="Size")
-        row.prop(p, "size_in_feet", text="ft" if p.size_in_feet else "m", toggle=True)
-        unit = "ft" if p.size_in_feet else "m"
-        box.prop(p, "hex_edge_shown", text=f"Hex edge length ({unit})")
-        box.prop(p, "level_shown", text=f"Level height ({unit})")
-        box.prop(p, "roof_shown", text=f"Roof height ({unit})")
-
-        box = layout.box()
-        box.label(text="Height")
-        box.prop(p, "max_layers")
-        box.prop(p, "tower_min")
-        box.prop(p, "tower_max")
-
-        box = layout.box()
-        box.label(text="Roads and seed")
-        row = box.row(align=True)
-        row.prop(p, "seed")
-        row.operator("arcology.reseed", text="", icon='FILE_REFRESH')
-        box.prop(p, "road_chance")
-
-        box = layout.box()
-        box.label(text="Show")
-        grid = box.grid_flow(columns=2, align=True)
-        grid.prop(p, "show_towers")
-        grid.prop(p, "show_roads")
-        grid.prop(p, "show_trapezoids")
-        grid.prop(p, "show_parks")
-        grid.prop(p, "show_elevators")
-        grid.prop(p, "show_walls")
-        grid.prop(p, "show_trees")
-        grid.prop(p, "show_benches")
-        grid.prop(p, "show_columns")
-        grid.prop(p, "show_paths")
-        box.prop(p, "park_density")
-        box.prop(p, "trees_per_cell")
-        box.prop(p, "benches_per_cell")
-
-        box = layout.box()
-        box.label(text="Stats")
-        cells = p.last_hex_count
-        if cells:
-            box.label(text=f"Hexagon cells (every layer, excluding transport and parks): {cells:,}")
+        if scene.arcology_shape == SHAPE_HEX:
+            _draw_hex(layout, p)
+        elif scene.arcology_shape == SHAPE_OCT:
+            _draw_oct(layout, scene.arcology_octagon)
         else:
-            box.label(text="Hexagon cells (every layer, excluding transport and parks): rebuild to count")
-        box.prop(p, "stat_residential")
-        box.prop(p, "stat_residents")
-        box.prop(p, "stat_cost")
-        population = cells * p.stat_residential * p.stat_residents
-        cost_m = cells * p.stat_cost
-        cost_text = f"${cost_m:,.1f} M" if cost_m < 1000 else f"${cost_m / 1000:,.2f} B"
-        box.label(text=f"Estimated Population: {population:,.0f}")
-        box.label(text=f"Estimated Cost: {cost_text}")
-        if p.last_footprint:
-            # Land area: the footprint hexagons, each with area (3*sqrt(3)/2) * edge^2 (edge in meters)
-            land_m2 = p.last_footprint * (3.0 * math.sqrt(3.0) / 2.0) * p.hex_edge ** 2
-            acres = land_m2 / 4046.8564224
-            sq_miles = land_m2 / 2589988.11
-            pop_per_sq_mile = population / sq_miles if sq_miles > 0 else 0.0
-            box.label(text=f"Estimated Land Area: {acres:,.2f} acres")
-            box.label(text=f"Population / square mile: {pop_per_sq_mile:,.0f}")
-            box.label(text=f"Density Compared to Manhattan: {pop_per_sq_mile / MANHATTAN_DENSITY:,.2f}x")
-        else:
-            box.label(text="Estimated Land Area: rebuild to calculate")
-        box.prop(p, "stat_household")
-        box.prop(p, "stat_mortgage_rate")
-        # Cost per household: the hexagon cost divided by (residents per hexagon / persons per household)
-        households_per_hex = p.stat_residents / p.stat_household if p.stat_household > 0 else 0.0
-        cost_per_household = (p.stat_cost * 1_000_000.0) / households_per_hex if households_per_hex > 0 else 0.0
-        payment = monthly_mortgage_payment(cost_per_household, p.stat_mortgage_rate)
-        box.label(text=f"Cost per household: ${cost_per_household:,.0f}")
-        box.label(text=f"Estimated Mortgage Payment: ${payment:,.0f} / month")
-
+            layout.box().label(text="Under Construction")
 
 CLASSES = (
+    OctagonProps,
     ArcologyProps,
     ARCOLOGY_OT_rebuild,
     ARCOLOGY_OT_clear,
@@ -1614,6 +2545,16 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.arcology_props = PointerProperty(type=ArcologyProps)
+    bpy.types.Scene.arcology_octagon = PointerProperty(type=OctagonProps)
+    bpy.types.Scene.arcology_shape = EnumProperty(
+        name="Shape",
+        items=(
+            (SHAPE_HEX, "Hexagon", "The hexagon city"),
+            (SHAPE_OCT, "Octagon", "The octagon city, with square gaps"),
+            (SHAPE_RECT, "Rectangle", "Under construction"),
+        ),
+        default=SHAPE_HEX,
+        description="Which city the Build and Clear buttons work on")
 
 
 def unregister():
@@ -1623,6 +2564,8 @@ def unregister():
     except Exception:
         pass
     _pending = False
+    del bpy.types.Scene.arcology_shape
+    del bpy.types.Scene.arcology_octagon
     del bpy.types.Scene.arcology_props
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
