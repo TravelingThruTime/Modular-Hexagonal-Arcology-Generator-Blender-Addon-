@@ -5,9 +5,9 @@ Builds the hex arcology from ultra-low-poly proxy shapes (hex prisms, boxes and 
 your detailed modules, so it can rebuild live while you drag the sliders in the sidebar.
 
 Install: Edit > Preferences > Add-ons > Install from Disk, pick this file, tick the add-on on.
-Use: 3D Viewport > N sidebar > "Arcology" tab. Under Build, pick the shape: Hexagon, Octagon or Rectangle.
-Each shape has its own settings and makes its own city. Build replaces the city in the scene, and Clear
-removes it.
+Use: 3D Viewport > N sidebar > "Arcology" tab. The list holds one arcology per footprint: press + to add
+one, then pick its footprint mesh and its shape (Hexagon or Octagon). Each arcology has its own settings,
+so you can mix shapes and values. Build replaces the city in the scene, and Clear removes it.
 
 Every change to a slider rebuilds the city a moment later (turn "Live" off to rebuild by hand).
 Output goes to the "Arcology Proxy" collection, or to the collections you pick in the Collections box.
@@ -21,7 +21,7 @@ so it can be sculpted into slopes. Without one, every hex gets the layer cap.
 bl_info = {
     "name": "Modular Hexagonal Arcology Generator",
     "author": "Traveling",
-    "version": (2, 0, 0),
+    "version": (1, 4, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Arcology",
     "description": "Generates the hex arcology from ultra-low-poly proxies, live, with sliders.",
@@ -88,6 +88,7 @@ CAT_COLORS = {
     "tiles": (0.78, 0.74, 0.66, 1.0),
     "roads": (0.22, 0.22, 0.24, 1.0),
     "road_octagons": (0.30, 0.30, 0.33, 1.0),
+    "road_rectangles": (0.30, 0.30, 0.33, 1.0),
     "roofs": (0.55, 0.55, 0.58, 1.0),
     "towers": (0.92, 0.91, 0.88, 1.0),
     "trapezoids": (0.70, 0.62, 0.52, 1.0),
@@ -121,6 +122,7 @@ def make_layout(p):
         ROOF_H=roof,
         PITCH=level + roof,
         TRAP_TOL=TRAP_TOL_FRAC * S,
+        TREE_SCALE=p.tree_scale,
         WALL_T=WALL_THICK_FRAC * S,
     )
 
@@ -187,15 +189,17 @@ def rect_poly(c, ux, half_u, half_v):
 # ---------------------------------------------------------------------------
 # Footprint, roof plane and lattice
 # ---------------------------------------------------------------------------
-def footprint_object(p):
-    if p.footprint is not None and p.footprint.type == 'MESH':
-        return p.footprint
+def default_footprint(context):
+    """The footprint a new arcology starts on: the active mesh (not one of the add-on's own), else the first
+    of 'Ark Polygon' or '30 Acre Ark' found in the file. None when there is neither."""
+    ob = context.active_object
+    if ob is not None and ob.type == 'MESH' and not ob.get(PROXY_TAG):
+        return ob
     for name in FOOTPRINT_NAMES:
         ob = bpy.data.objects.get(name)
         if ob is not None and ob.type == 'MESH':
             return ob
-    raise RuntimeError("No footprint mesh. Pick one in the Footprint field, or name a mesh "
-                       "'Ark Polygon' or '30 Acre Ark'.")
+    return None
 
 
 def mesh_height_tester(ob):
@@ -537,9 +541,10 @@ def add_sphere(bm, centre, radius, segs=8, rings=3):
 
 def add_tree(bm_trunk, bm_canopy, c, z0, scale, L):
     """A low-poly tree: an 8-sided trunk and a UV-sphere canopy, about 76 triangles in total."""
-    tr = TRUNK_R_FRAC * L.S * scale
-    th = TRUNK_H_FRAC * L.S * scale
-    cr = TREE_RADIUS_FRAC * L.S * scale
+    ts = getattr(L, "TREE_S", L.S)
+    tr = TRUNK_R_FRAC * ts * scale
+    th = TRUNK_H_FRAC * ts * scale
+    cr = TREE_RADIUS_FRAC * ts * scale
     ring = [Vector((c.x + tr * math.cos(k * math.tau / 8), c.y + tr * math.sin(k * math.tau / 8)))
             for k in range(8)]
     add_prism(bm_trunk, ring, z0, z0 + th)
@@ -551,7 +556,7 @@ def tree_spots(c, n, rng, L):
     """Up to n tree positions inside one hex (random, with canopies kept apart).
     Returns (position, size scale) pairs."""
     spots = []
-    cr_max = TREE_RADIUS_FRAC * L.S * 1.15
+    cr_max = TREE_RADIUS_FRAC * getattr(L, "TREE_S", L.S) * 1.15 * getattr(L, "TREE_SCALE", 1.0)
     reach = L.APO - cr_max - 0.5
     for _ in range(n * 40):
         if len(spots) >= n:
@@ -559,7 +564,7 @@ def tree_spots(c, n, rng, L):
         a = rng.random() * math.tau
         r = reach * math.sqrt(rng.random())
         pos = c + Vector((math.cos(a) * r, math.sin(a) * r))
-        scale = rng.uniform(0.85, 1.15)
+        scale = rng.uniform(0.85, 1.15) * getattr(L, "TREE_SCALE", 1.0)
         if all((pos - q).length >= 2.2 * cr_max for q, _ in spots):
             spots.append((pos, scale))
     return spots
@@ -575,7 +580,7 @@ def bench_spots(c, n, trees, rng, L):
         a = rng.random() * math.tau
         r = reach * math.sqrt(rng.random())
         pos = c + Vector((math.cos(a) * r, math.sin(a) * r))
-        clear = all((pos - tp).length >= TREE_RADIUS_FRAC * L.S * sc + 2.5 for tp, sc in trees)
+        clear = all((pos - tp).length >= TREE_RADIUS_FRAC * getattr(L, "TREE_S", L.S) * sc + 2.5 for tp, sc in trees)
         clear = clear and all((pos - q).length >= 3.0 for q, _ in spots)
         if clear:
             spots.append((pos, rng.random() * math.tau))
@@ -855,9 +860,8 @@ def place_picked_parks(shapes, sites, rng, L):
     return placed
 
 
-def write_copies(scene, records):
+def write_copies(root, records):
     """Writes the copies of your source objects into the Hexagons, Road Trapezoids and Parks groups."""
-    root = output_collection(scene)
     parents = {}
     for n, rec in enumerate(records):
         key = (rec["cat"], rec["layer"])
@@ -882,23 +886,25 @@ def write_copies(scene, records):
     return len(records)
 
 
-def build_city(p):
+def build_city(p, fp=None, index=0):
     L = make_layout(p)
     road_w = p.road_width_ft * FT                        # the road width set in the Size box
-    fp = footprint_object(p)
+    seed = p.seed + index                       # each arcology on its own footprint gets its own layout
+    if fp is None:
+        raise RuntimeError("This arcology has no footprint mesh")
     height_at, lo, hi = mesh_height_tester(fp)
     inside = lambda x, y: height_at(x, y) is not None
-    rng = random.Random(p.seed)
-    copy_rng = random.Random(p.seed * 7919 + 1)     # separate, so picking objects never moves the layout
+    rng = random.Random(seed)
+    copy_rng = random.Random(seed * 7919 + 1)     # separate, so picking objects never moves the layout
     records = []                                    # copies of your objects, written after the proxies
     hex_src = source_pool(p.coll_hexagons)
     trap_src = source_pool(p.coll_trapezoids)
     park_src = source_pool(p.coll_parks)
     wall_src = source_pool(p.coll_walls)
     roof_src = source_pool(p.coll_roof)
-    roof_rng = random.Random(p.seed * 7919 + 2)     # roof picks have their own random sequence
+    roof_rng = random.Random(seed * 7919 + 2)     # roof picks have their own random sequence
     elevator_src = source_pool(p.coll_elevators)
-    elev_rng = random.Random(p.seed * 7919 + 3)     # elevator picks have their own random sequence
+    elev_rng = random.Random(seed * 7919 + 3)     # elevator picks have their own random sequence
     for e in park_src:
         n_hex = round(poly_area(e["hull"]) / (2.598076 * L.R * L.R))   # hexagon area = 2.598 R^2
         cells = TRI_CELLS if n_hex >= 2 else [(0, 0)]
@@ -1133,7 +1139,7 @@ def build_city(p):
                         if path_z.get((Hp, round(nb.x, 1), round(nb.y, 1))) == z_path:
                             edges.append(m)
                     add_path(bucket("paths", Hp), cell, z_path, rng, L, edges)
-                trees = tree_spots(cell, p.trees_per_cell, rng, L) if p.show_trees else []
+                trees = tree_spots(cell, p.trees_per_cell, rng, L) if p.show_trees and p.tree_scale > 0 else []
                 for pos, sc in trees:
                     add_tree(bucket("trunks", Hp), bucket("canopies", Hp), pos, z_base + slab_h, sc, L)
                     tree_count += 1
@@ -1178,6 +1184,7 @@ def build_city(p):
 SHAPE_HEX = "HEXAGON"
 SHAPE_OCT = "OCTAGON"
 SHAPE_RECT = "RECTANGLE"
+SHAPE_PEN = "PENROSE"
 SQRT2 = math.sqrt(2.0)
 OCT_ANGLES = tuple(22.5 + 45.0 * k for k in range(8))     # octagon corners; its sides face 0, 45, 90 ...
 OCT_AXIAL = {0: (1, 0), 2: (0, 1), 4: (-1, 0), 6: (0, -1)} # side index -> neighbour step (sides 0,2,4,6 face axes)
@@ -1198,7 +1205,7 @@ def oct_layout(p):
     apo = e * (1.0 + SQRT2) / 2.0                        # centre to side
     R = e / (2.0 * math.sin(math.radians(22.5)))         # centre to corner
     return SimpleNamespace(
-        EDGE=e, APO=apo, R=R, S=2.0 * apo, D=e * (1.0 + SQRT2),
+        EDGE=e, APO=apo, R=R, S=2.0 * apo, D=e * (1.0 + SQRT2), TREE_SCALE=p.tree_scale,
         HEX_H=p.level_ft * FT, ROOF_H=p.roof_ft * FT, PITCH=p.level_ft * FT + p.roof_ft * FT,
         WALL_T=WALL_THICK_FRAC * 2.0 * apo, ROAD_W=p.road_width_ft * FT,
     )
@@ -1394,26 +1401,29 @@ def road_octagon_record(pool, rng, c, z, height, layer, horizontal, turn=0.0, sr
             "matrix": T @ Matrix.Rotation(theta, 4, 'Z') @ Sz @ C @ src["obj"].matrix_world}
 
 
-def build_octagon_city(p):
+def build_octagon_city(p, fp=None, index=0):
     """The octagon city, as the hexagon one: towers, roads, junctions with elevators, gap squares,
     walls, roofs and parks. Returns (buckets, stats, records) like build_city."""
     L = oct_layout(p)
-    fp = footprint_object(p)
+    seed = p.seed + index                       # each arcology on its own footprint gets its own layout
+    if fp is None:
+        raise RuntimeError("This arcology has no footprint mesh")
     height_at, lo, hi = mesh_height_tester(fp)
     inside = lambda x, y: height_at(x, y) is not None
-    rng = random.Random(p.seed)
-    copy_rng = random.Random(p.seed * 7919 + 21)     # picks have their own sequences, so the layout is fixed
-    roof_rng = random.Random(p.seed * 7919 + 22)
-    elev_rng = random.Random(p.seed * 7919 + 23)
+    rng = random.Random(seed)
+    copy_rng = random.Random(seed * 7919 + 21)     # picks have their own sequences, so the layout is fixed
+    roof_rng = random.Random(seed * 7919 + 22)
+    elev_rng = random.Random(seed * 7919 + 23)
     records = []
     oct_src = source_pool(p.coll_octagons)
     sq_src = source_pool(p.coll_squares)
     roof_src = source_pool(p.coll_roof)
+    sq_roof_src = source_pool(p.coll_square_roofs)
     wall_src = source_pool(p.coll_walls)
     park_src = source_pool(p.coll_parks)
     elev_src = source_pool(p.coll_elevators)
     road_src = source_pool(p.coll_road_octagons)
-    road_rng = random.Random(p.seed * 7919 + 24)
+    road_rng = random.Random(seed * 7919 + 24)
 
     octs, sqs = oct_lattice(inside, lo, hi, rng, L)
     if not octs:
@@ -1496,8 +1506,8 @@ def build_octagon_city(p):
 
     # Gap squares: a module on each level above the ground block, and a roof above each module.
     def sq_roof(m, z0, z1, layer):
-        if roof_src:
-            records.append(poly_record(roof_src, roof_rng, m, z0, z1 - z0, layer, L.EDGE / 2.0, 4, 45.0,
+        if sq_roof_src:
+            records.append(poly_record(sq_roof_src, roof_rng, m, z0, z1 - z0, layer, L.EDGE / 2.0, 4, 45.0,
                                        "Roof", "roofs"))
         else:
             add_prism(bucket("roofs", layer), square_ring(m, L.EDGE), z0, z1)
@@ -1641,7 +1651,7 @@ def build_octagon_city(p):
     tree_count = 0
     bench_count = 0
     placed_oct = []                                                 # octagon park cells: (centre, layer, slab height, base z)
-    path_rng = random.Random(p.seed * 7919 + 25)                    # its own sequence, so other parks do not move
+    path_rng = random.Random(seed * 7919 + 25)                    # its own sequence, so other parks do not move
     if p.show_parks:
         L_sq = SimpleNamespace(**{**vars(L), "APO": L.EDGE / 2.0})   # trees and benches fit a square
         sites = []                                                  # (centre, top layer, base z, is a square)
@@ -1672,7 +1682,7 @@ def build_octagon_city(p):
             if not is_sq:
                 placed_oct.append((c, Hp, slab_h, z_base))
             Lc = L_sq if is_sq else L
-            trees = tree_spots(c, p.trees_per_cell, rng, Lc) if p.show_trees else []
+            trees = tree_spots(c, p.trees_per_cell, rng, Lc) if p.show_trees and p.tree_scale > 0 else []
             for pos, sc in trees:
                 add_tree(bucket("trunks", Hp), bucket("canopies", Hp), pos, z_base + slab_h, sc, Lc)
                 tree_count += 1
@@ -1719,6 +1729,956 @@ def build_octagon_city(p):
 
 
 # ---------------------------------------------------------------------------
+# The rectangle city: rectangles that touch edge to edge (no gap squares). Every road rectangle has
+# a 12 ft hallway down the middle along its length, like the road octagons have their centre hallway.
+# ---------------------------------------------------------------------------
+RECT_SHAFT_FT = 14.0                                   # elevator shafts in a junction rectangle: 14 ft square
+RECT_SIDES = {0: (1, 0), 1: (0, 1), 2: (-1, 0), 3: (0, -1)}      # side index: east, north, west, south
+RECT_SIDE_INDEX = {v: k for k, v in RECT_SIDES.items()}
+
+
+def rect_layout(p):
+    """Rectangle geometry from its own width and length (in metres). The cells touch, so there are no gaps."""
+    W, Lg = p.rect_width, p.rect_length
+    HW, HL = W / 2.0, Lg / 2.0
+    return SimpleNamespace(
+        W=W, LG=Lg, HW=HW, HL=HL, APO=min(HW, HL), S=2.0 * min(HW, HL), R=math.hypot(HW, HL),
+        TREE_SCALE=p.tree_scale,
+        HEX_H=p.level_ft * FT, ROOF_H=p.roof_ft * FT, PITCH=p.level_ft * FT + p.roof_ft * FT,
+        WALL_T=WALL_THICK_FRAC * min(W, Lg), ROAD_W=p.road_width_ft * FT,
+    )
+
+
+def rect_ring(c, L):
+    return rect_poly(c, Vector((1.0, 0.0)), L.HW, L.HL)
+
+
+def rect_lattice(inside, lo, hi, rng, L):
+    """Rectangle centres inside the footprint, on a grid that touches edge to edge, from a random offset."""
+    ox = lo.x + rng.random() * L.W
+    oy = lo.y + rng.random() * L.LG
+    cells = {}
+    i_min = int(math.floor((lo.x - ox) / L.W)) - 2
+    i_max = int(math.ceil((hi.x - ox) / L.W)) + 2
+    j_min = int(math.floor((lo.y - oy) / L.LG)) - 2
+    j_max = int(math.ceil((hi.y - oy) / L.LG)) + 2
+    for j in range(j_min, j_max + 1):
+        for i in range(i_min, i_max + 1):
+            c = Vector((ox + i * L.W, oy + j * L.LG))
+            if inside(c.x, c.y):
+                cells[(i, j)] = c
+    return cells
+
+
+def rect_blocked_sides(links):
+    """Rectangle sides a road or hallway runs through, so no wall there. A Width road (across the width) has
+    its hallway down the length, out through the north and south sides. A Length road (along the length) has
+    its hallway across the width, out through the east and west sides. A road also leaves by its own side."""
+    out = set()
+    for dx, dy in links:
+        out.add(RECT_SIDE_INDEX[(dx, dy)])
+        if dx:
+            out |= {1, 3}
+        else:
+            out |= {0, 2}
+    return out
+
+
+def rect_road_pieces(c, links, L):
+    """A road rectangle with no road copies picked: the rectangle less the road strips to each side it
+    connects to, and less the 12 ft hallway through its middle, across the road. Returns convex pieces."""
+    half_road = L.ROAD_W / 2.0
+    half_hall = HALLWAY_HALF_FT * FT
+    margin = 0.1
+    cuts = []
+    for dx, dy in links:
+        u = Vector((dx, dy))
+        reach = (L.HW if dx else L.HL) + margin
+        cuts.append(rect_poly(s_centre(c, u, reach), u, reach / 2.0, half_road))
+    if any(dx for dx, dy in links):                                          # a Width road: hallway down the length
+        cuts.append(rect_poly(c, Vector((0.0, 1.0)), L.HL + margin, half_hall))
+    else:                                                                    # a Length road: hallway across the width
+        cuts.append(rect_poly(c, Vector((1.0, 0.0)), L.HW + margin, half_hall))
+    pieces = [rect_ring(c, L)]
+    for cut in cuts:
+        nxt = []
+        for piece in pieces:
+            nxt.extend(_subtract_convex(piece, cut))
+        pieces = nxt
+    return pieces
+
+
+def s_centre(c, u, reach):
+    """Centre of a strip that starts at c and runs reach along the unit vector u."""
+    return c + u * (reach / 2.0)
+
+
+def road_rect_record(src, c, z, height, layer, L, turn):
+    """A copy of one Road Rectangles object on a road rectangle. Its origin sits at the centre of the
+    rectangle. Its X axis is stretched to the rectangle's width and its Y axis to its length, and it is
+    stretched to the road height. The second copy is turned 180 degrees."""
+    xs = [v.x for v in src["hull"]]
+    ys = [v.y for v in src["hull"]]
+    ext_x = max(xs) - min(xs)
+    ext_y = max(ys) - min(ys)
+    kx = L.W / ext_x if ext_x > 1e-9 else 1.0
+    ky = L.LG / ext_y if ext_y > 1e-9 else 1.0
+    kz = height / src["height"] if src["height"] > 0 else 1.0
+    C = Matrix.Translation((-src["c0"].x, -src["c0"].y, -src["zb"]))
+    Sz = Matrix.Diagonal(Vector((kx, ky, kz, 1.0)))
+    T = Matrix.Translation((c.x, c.y, z))
+    return {"group": "Road Rectangles", "cat": "roads", "layer": layer, "src": src,
+            "matrix": T @ Matrix.Rotation(turn, 4, 'Z') @ Sz @ C @ src["obj"].matrix_world}
+
+
+def fit_to_rect(piece, theta, half_w, half_l):
+    """Largest uniform XY scale at which the piece, turned by theta, stays inside a rectangle of these
+    half sizes centred on the origin."""
+    pts = [rot2(p, theta) for p in piece["hull"]]
+    reach_x = max(abs(p.x) for p in pts)
+    reach_y = max(abs(p.y) for p in pts)
+    s = 1e6
+    if reach_x > 1e-6:
+        s = min(s, half_w / reach_x)
+    if reach_y > 1e-6:
+        s = min(s, half_l / reach_y)
+    return s
+
+
+def rect_record(pool, rng, c, z, height, layer, half_w, half_l, group, cat):
+    """A copy of one of your objects, turned 0 or 180 degrees, scaled evenly to fill the rectangle, and
+    stretched to the given height. Used for towers, roofs and the like."""
+    src = pool[rng.randrange(len(pool))]
+    theta = rng.randrange(2) * math.pi
+    s = fit_to_rect(src, theta, half_w, half_l)
+    kz = height / src["height"] if src["height"] > 0 else 1.0
+    P_ = Matrix.Translation((c.x, c.y, z)) @ Matrix.Rotation(theta, 4, 'Z')
+    Sc = Matrix.Diagonal(Vector((s, s, kz, 1.0)))
+    T = Matrix.Translation(-src["bottom_center"])
+    return {"group": group, "cat": cat, "layer": layer, "src": src,
+            "matrix": P_ @ Sc @ T @ src["obj"].matrix_world}
+
+
+def add_rect_path(bm, c, z0, rng, L, sides):
+    """A roof path through one park rectangle, 4 ft wide, as flat quads. sides are the rectangle sides whose
+    neighbour also has a path (0 east, 1 north, 2 west, 3 south): the path runs from the centre out to each of
+    them, and so meets the next rectangle at its edge. With no neighbours it runs straight across, along a
+    random axis."""
+    w = PATH_WIDTH_FT * FT
+    strips = []
+    if sides:
+        for side in sorted(sides):
+            u = Vector(RECT_SIDES[side])
+            reach = L.HW if side in (0, 2) else L.HL
+            strips.append(rect_poly(s_centre(c, u, reach), u, reach / 2.0, w / 2.0))
+    else:
+        u = Vector((1.0, 0.0)) if rng.randrange(2) == 0 else Vector((0.0, 1.0))
+        reach = L.HW if u.x else L.HL
+        strips.append(rect_poly(c, u, reach, w / 2.0))
+    for poly in strips:
+        verts = [bm.verts.new((p.x, p.y, z0)) for p in poly]
+        try:
+            bm.faces.new(verts)
+        except ValueError:
+            pass
+
+
+def rect_tree_spots(c, n, rng, L):
+    """Up to n tree positions spread over the whole rectangle, kept clear of its edges, with canopies kept
+    apart. Returns (position, size scale) pairs."""
+    spots = []
+    cr_max = TREE_RADIUS_FRAC * getattr(L, "TREE_S", L.S) * 1.15 * getattr(L, "TREE_SCALE", 1.0)
+    hx = L.HW - cr_max - 0.5
+    hy = L.HL - cr_max - 0.5
+    if hx <= 0 or hy <= 0:
+        return spots
+    for _ in range(n * 40):
+        if len(spots) >= n:
+            break
+        pos = c + Vector((rng.uniform(-hx, hx), rng.uniform(-hy, hy)))
+        scale = rng.uniform(0.85, 1.15) * getattr(L, "TREE_SCALE", 1.0)
+        if all((pos - q).length >= 2.2 * cr_max for q, _ in spots):
+            spots.append((pos, scale))
+    return spots
+
+
+def rect_bench_spots(c, n, trees, rng, L):
+    """Up to n bench positions spread over the whole rectangle, clear of the trees and of its edges.
+    Returns (position, angle) pairs."""
+    spots = []
+    hx = L.HW - 2.0
+    hy = L.HL - 2.0
+    if hx <= 0 or hy <= 0:
+        return spots
+    for _ in range(n * 40):
+        if len(spots) >= n:
+            break
+        pos = c + Vector((rng.uniform(-hx, hx), rng.uniform(-hy, hy)))
+        clear = all((pos - tp).length >= TREE_RADIUS_FRAC * getattr(L, "TREE_S", L.S) * sc + 2.5 for tp, sc in trees)
+        clear = clear and all((pos - q).length >= 3.0 for q, _ in spots)
+        if clear:
+            spots.append((pos, rng.random() * math.tau))
+    return spots
+
+
+def build_rect_city(p, fp=None, index=0):
+    """The rectangle city: touching rectangles, a 12 ft hallway down each road rectangle, junctions with
+    elevators, towers, walls, roofs, parks, columns and roof paths. Returns (buckets, stats, records) like
+    build_octagon_city."""
+    L = rect_layout(p)
+    seed = p.seed + index                       # each arcology on its own footprint gets its own layout
+    if fp is None:
+        raise RuntimeError("This arcology has no footprint mesh")
+    height_at, lo, hi = mesh_height_tester(fp)
+    inside = lambda x, y: height_at(x, y) is not None
+    rng = random.Random(seed)
+    copy_rng = random.Random(seed * 7919 + 21)
+    roof_rng = random.Random(seed * 7919 + 22)
+    elev_rng = random.Random(seed * 7919 + 23)
+    road_rng = random.Random(seed * 7919 + 24)
+    path_rng = random.Random(seed * 7919 + 25)
+    records = []
+    tower_src = source_pool(p.coll_rectangles)
+    width_road_src = source_pool(p.coll_width_road_rectangles)
+    length_road_src = source_pool(p.coll_length_road_rectangles)
+    roof_src = source_pool(p.coll_roof)
+    wall_src = source_pool(p.coll_walls)
+    park_src = source_pool(p.coll_parks)
+    elev_src = source_pool(p.coll_elevators)
+
+    cells = rect_lattice(inside, lo, hi, rng, L)
+    if not cells:
+        raise RuntimeError("No rectangles fall inside the footprint.")
+
+    cap = max(1, p.max_layers)
+    plane = None
+    if p.roof_plane is not None and p.roof_plane.type == 'MESH':
+        plane, _, _ = mesh_height_tester(p.roof_plane)
+    hmax = {}
+    for key, c in cells.items():
+        if plane is None:
+            n = cap
+        else:
+            z = plane(c.x, c.y)
+            n = 1 if z is None else layers_under(z, L)
+        hmax[key] = max(1, min(cap, n))
+
+    edges, degree = oct_random_roads(cells, rng, p.road_chance, p.max_cells_between_roads, p.min_cells_between_roads)
+    hubs = {k for k in cells if degree[k] >= 3}              # junctions: transport rectangles
+    roads = {k for k in cells if 1 <= degree[k] < 3}          # road rectangles
+    towers = {k for k in cells if degree[k] == 0}
+
+    tmin, tmax = sorted((p.tower_min, p.tower_max))
+    tower_heights = {}
+    for key in sorted(towers):
+        tower_heights[key] = min(rng.randint(max(1, tmin), max(1, tmax)), hmax[key])
+    top = dict(hmax)
+    for key, H in tower_heights.items():
+        top[key] = H
+
+    buckets = {}
+
+    def bucket(cat, layer):
+        k = (cat, layer)
+        if k not in buckets:
+            buckets[k] = bmesh.new()
+        return buckets[k]
+
+    P = L.PITCH
+    H_ = L.HEX_H
+
+    # Ground: a tile under every rectangle, except roads and junctions, which have their own floors.
+    for key, c in cells.items():
+        if key not in roads and key not in hubs:
+            add_prism(bucket("tiles", 1), rect_ring(c, L), TILE_BOT, TILE_TOP)
+
+    def roof(c, z0, z1, layer):
+        if roof_src:
+            records.append(rect_record(roof_src, roof_rng, c, z0, z1 - z0, layer, L.HW, L.HL, "Roof", "roofs"))
+        else:
+            add_prism(bucket("roofs", layer), rect_ring(c, L), z0, z1)
+
+    # Towers: a module on each level, a roof above each module.
+    if p.show_towers:
+        for key in sorted(towers):
+            c = cells[key]
+            for k in range(tower_heights[key] - 1):
+                z = TILE_TOP + k * P
+                if tower_src:
+                    records.append(rect_record(tower_src, copy_rng, c, z, H_, k + 1, L.HW, L.HL,
+                                               "Rectangles", "towers"))
+                else:
+                    add_prism(bucket("towers", k + 1), rect_ring(c, L), z, z + H_)
+                roof(c, z + H_, z + P, k + 2)
+
+    # Road rectangles and junctions: floors and roofs, as the octagon ones.
+    for key in sorted(roads | hubs):
+        c = cells[key]
+        base = ROAD_BASE if key in roads else TILE_TOP
+        for k in range(hmax[key] - 1):
+            z = base + k * P
+            roof(c, z + H_, z + P, k + 2)
+
+    links = {}
+    for a, b in edges:
+        d = (b[0] - a[0], b[1] - a[1])
+        links.setdefault(a, []).append(d)
+        links.setdefault(b, []).append((-d[0], -d[1]))
+
+    # Roads: a strip from the centre out to each side the road leaves by. With Road Rectangles picked, each road
+    # rectangle gets two copies, 180 degrees apart. Without, it is the rectangle less the strips and the hallway.
+    if p.show_roads:
+        for key in sorted(roads | hubs):
+            c = cells[key]
+            dirs = links.get(key, [])
+            for k in range(max(1, hmax[key] - 1)):
+                z = ROAD_BASE + k * P
+                for dx, dy in dirs:
+                    u = Vector((dx, dy))
+                    reach = L.HW if dx else L.HL
+                    add_prism(bucket("roads", k + 1), rect_poly(s_centre(c, u, reach), u, reach / 2.0, L.ROAD_W / 2.0),
+                              z, z + ROAD_H)
+                if key not in roads:                  # a junction: road strips and elevators only
+                    continue
+                across = any(dx for dx, dy in dirs)               # a Width road runs across the width
+                pool = width_road_src if across else length_road_src
+                if pool:
+                    pick = pool[road_rng.randrange(len(pool))]
+                    for turn in (0.0, math.pi):
+                        records.append(road_rect_record(pick, c, z, H_, k + 1, L, turn))
+                else:
+                    for piece in rect_road_pieces(c, dirs, L):
+                        add_prism(bucket("road_rectangles", k + 1), piece, z, z + H_)
+
+    # Elevators: one per level in every junction. Four shafts, one in each quarter, unless Elevators is picked.
+    if p.show_elevators:
+        elev_h = ELEVATOR_H_FT * FT
+        for key in sorted(hubs):
+            c = cells[key]
+            for k in range(hmax[key]):
+                z = TILE_TOP + k * P
+                if elev_src:
+                    records.append(elevator_record(elev_src, elev_rng, c, z, elev_h, k + 1))
+                else:
+                    half = RECT_SHAFT_FT * FT / 2.0
+                    for sx in (-1.0, 1.0):
+                        for sy in (-1.0, 1.0):
+                            centre = c + Vector((sx * (L.HW - half), sy * (L.HL - half)))   # flush in each corner
+                            add_prism(bucket("elevators", k + 1), rect_poly(centre, Vector((1.0, 0.0)), half, half),
+                                      z, z + elev_h)
+
+    # Columns: a 3 ft octagonal column at every rectangle corner, one per level of the stack on that corner.
+    if p.show_columns:
+        col_r = 1.5 * FT / math.cos(math.radians(22.5))
+        col_site = {}
+        for key, c in cells.items():
+            layers = top[key]
+            base = ROAD_BASE if key in roads else TILE_TOP
+            for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)):
+                v = c + Vector((sx * L.HW, sy * L.HL))
+                site = (round(v.x, 3), round(v.y, 3))
+                if site not in col_site or col_site[site][1] < layers:
+                    col_site[site] = (v, layers, base)
+        for v, layers, base in col_site.values():
+            column = oct_ring(v, col_r)
+            for k in range(max(0, layers - 1)):
+                add_prism(bucket("columns", k + 1), column, base + k * P, base + (k + 1) * P)
+
+    # Walls: on every side that is exposed, where the rectangle across it is shorter.
+    walls = 0
+
+    def side_walls(c, ang, reach, length, tb, ta):
+        """Walls on one side of a rectangle, from the level above the neighbour up to the rectangle's top."""
+        n = Vector((math.cos(math.radians(ang)), math.sin(math.radians(ang))))
+        centre = c + n * (reach + L.WALL_T / 2.0)
+        tangent = Vector((-n.y, n.x))
+        count = 0
+        for k in range(max(tb - 1, 0), ta - 1):
+            z = TILE_TOP + k * P
+            if wall_src:
+                records.append(wall_record(wall_src, copy_rng, centre, ang, z, H_, k + 1, L,
+                                           length=length, thick=L.WALL_T))
+            else:
+                add_prism(bucket("walls", k + 1), rect_poly(centre, tangent, length / 2.0, L.WALL_T / 2.0),
+                          z, z + H_)
+            count += 1
+        return count
+
+    if p.show_walls:
+        for key in sorted(cells):
+            ta = top[key]
+            blocked = rect_blocked_sides(links.get(key, [])) if (key in roads or key in hubs) else set()
+            for side in range(4):
+                if side in blocked:
+                    continue
+                da, db = RECT_SIDES[side]
+                tb = top.get((key[0] + da, key[1] + db), 0)
+                if tb >= ta:
+                    continue
+                across_x = side in (0, 2)                  # east and west walls run north-south
+                reach = L.HW if across_x else L.HL
+                length = L.LG if across_x else L.W
+                walls += side_walls(cells[key], 90.0 * side, reach, length, tb, ta)
+
+    # Parks on the top level of each tower, road rectangle (two levels or more) and junction.
+    parks = 0
+    tree_count = 0
+    bench_count = 0
+    placed = []                                                     # (key, centre, layer, slab height, base z)
+    if p.show_parks:
+        sites = []                                                  # (key, centre, top layer, base z)
+        for key in sorted(cells):
+            c = cells[key]
+            if key in towers:
+                sites.append((key, c, top[key], TILE_TOP))
+            elif key in roads:
+                if hmax[key] >= 2:
+                    sites.append((key, c, hmax[key], ROAD_BASE))
+            else:
+                sites.append((key, c, hmax[key], TILE_TOP))
+        for key, c, Hp, zb in sites:
+            if rng.random() > p.park_density:
+                continue
+            z_base = zb + (Hp - 1) * P
+            if park_src:
+                src = park_src[copy_rng.randrange(len(park_src))]
+                th = copy_rng.randrange(2) * math.pi
+                records.append(park_record(src, [c], th, z_base, Hp))
+                slab_h = src["height"]
+            else:
+                add_prism(bucket("parks", Hp), rect_ring(c, L), z_base, z_base + PARK_SLAB_H)
+                slab_h = PARK_SLAB_H
+            placed.append((key, c, Hp, slab_h, z_base))
+            trees = rect_tree_spots(c, p.trees_per_cell, rng, L) if p.show_trees and p.tree_scale > 0 else []
+            for pos, sc in trees:
+                add_tree(bucket("trunks", Hp), bucket("canopies", Hp), pos, z_base + slab_h, sc, L)
+                tree_count += 1
+            if p.show_benches:
+                for pos, th_b in rect_bench_spots(c, p.benches_per_cell, trees, rng, L):
+                    add_bench(bucket("benches", Hp), pos, th_b, z_base + slab_h, L)
+                    bench_count += 1
+            parks += 1
+
+    # Roof paths: on every park rectangle, joined to the park rectangle across each side that also has one.
+    if p.show_paths and placed:
+        path_z = {}
+        for key, c, Hp, slab, zb_ in placed:
+            path_z[(Hp, key)] = zb_ + slab + PATH_LIFT_FT * FT
+        for key, c, Hp, slab, zb_ in placed:
+            z_path = zb_ + slab + PATH_LIFT_FT * FT
+            sides = []
+            for side, (da, db) in RECT_SIDES.items():
+                zn = path_z.get((Hp, (key[0] + da, key[1] + db)))
+                if zn is not None and abs(zn - z_path) < 1e-6:
+                    sides.append(side)
+            add_rect_path(bucket("paths", Hp), c, z_path, path_rng, L, sides)
+
+    # Cells for the Stats box: every level of every rectangle except junctions, less the top (park) level.
+    cells_counted = sum(max(0, hmax[key] - 1) for key in cells if key not in hubs)
+    stats = {
+        "footprint": len(cells),
+        "cells_counted": cells_counted,
+        "towers": len(towers),
+        "transport": len(hubs),
+        "walls": walls,
+        "parks": parks,
+        "trees": tree_count,
+        "benches": bench_count,
+        "top_layer": max(hmax.values()),
+    }
+    return buckets, stats, records
+
+
+# ---------------------------------------------------------------------------
+# Penrose city (its own tab, to the right of Rectangle). Penrose P3 rhombs, from de Bruijn's cut and project.
+# Thick rhombs (72 and 108 degrees) are towers. Thin rhombs (36 and 144 degrees) are roads. Two wide corners of
+# some thin rhombs hold elevator shafts, at least Elevator Distance apart, centre to centre.
+# ---------------------------------------------------------------------------
+import itertools
+import numpy as np
+
+PEN_E = np.array([[math.cos(math.radians(72 * k)), math.sin(math.radians(72 * k))] for k in range(5)])
+PEN_F = np.array([[math.cos(math.radians(144 * k)), math.sin(math.radians(144 * k)), 1.0] for k in range(5)])
+PEN_SHIFT = np.array([0.0137, 0.0291, 0.0053])
+PEN_MIN_EDGE_M = 6.0
+PEN_MAX_EDGE_M = 60.0
+PEN_ELEV_SHAFT_FT = 14.0                 # elevator shaft: 14 ft along each edge of a wide corner
+PEN_COLUMN_R = 1.5 * FT                  # column: a regular pentagon, 3 ft across the corners
+
+
+def penrose_tiles(extent, shift=None, M=None):
+    """Penrose tiles around the origin, out to `extent` tile edges. Returns (corners, kind) pairs: corners are four
+    points in edge-length units, kind is 'thick' or 'thin'. Each tile is found once, from its own lattice corner."""
+    shift = PEN_SHIFT if shift is None else np.asarray(shift, dtype=float)
+    if M is None:
+        M = int(math.ceil(0.4 * extent)) + 3
+    rng = np.arange(-M, M + 1)
+    rest = np.stack(np.meshgrid(rng, rng, rng, rng, indexing="ij"), axis=-1).reshape(-1, 4)
+    pairs = []
+    for a, b in itertools.combinations(range(5), 2):
+        others = [k for k in range(5) if k not in (a, b)]
+        pairs.append((a, b, np.linalg.inv(PEN_F[others].T)))
+    out = []
+    seen = set()
+    for n0 in rng:
+        grid = np.concatenate([np.full((len(rest), 1), n0), rest], axis=1)
+        phys = grid @ PEN_E
+        near = np.hypot(phys[:, 0], phys[:, 1]) <= extent + 2.0
+        if not near.any():
+            continue
+        inte = grid @ PEN_F + shift
+        for a, b, Minv in pairs:
+            coef = inte @ Minv.T
+            ok = near & np.all((coef >= 0.0) & (coef < 1.0), axis=1)
+            kind = 'thick' if (b - a) in (1, 4) else 'thin'
+            for i in np.nonzero(ok)[0]:
+                p0 = phys[i]
+                corners = np.array([p0, p0 + PEN_E[a], p0 + PEN_E[a] + PEN_E[b], p0 + PEN_E[b]])
+                if np.hypot(*corners.mean(axis=0)) > extent:
+                    continue
+                key = tuple(sorted(tuple(np.round(p, 6)) for p in corners))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((corners, kind))
+    return out
+
+
+def pen_layout(p):
+    return SimpleNamespace(EDGE=p.tile_edge, S=p.tile_edge, R=p.tile_edge, HEX_H=p.level_ft * FT,
+                           TREE_SCALE=p.tree_scale, TREE_S=2.0 / TREE_RADIUS_FRAC,
+                           ROOF_H=p.roof_ft * FT, PITCH=p.level_ft * FT + p.roof_ft * FT,
+                           WALL_T=WALL_THICK_FRAC * p.tile_edge)
+
+
+def fit_to_convex(piece, theta, rel):
+    """Largest uniform XY scale at which the piece, turned by theta, stays inside the convex polygon rel
+    (counter-clockwise, centred on the origin)."""
+    pts = [rot2(p, theta) for p in piece["hull"]]
+    s = 1e6
+    n = len(rel)
+    for i in range(n):
+        a, b = rel[i], rel[(i + 1) % n]
+        d = b - a
+        nrm = Vector((d.y, -d.x)).normalized()
+        off = nrm.dot(a)
+        reach = max(q.dot(nrm) for q in pts)
+        if reach > 1e-6 and off > 1e-9:
+            s = min(s, off / reach)
+    return s if s < 1e6 else 1.0
+
+
+def rhomb_record(pool, rng, cen, theta_base, rel, z, height, layer, group, cat):
+    """A copy of one of your objects, turned along the tile's edge (or half a turn), scaled evenly to fill the tile
+    and stretched to the given height. height None keeps the object's own height."""
+    src = pool[rng.randrange(len(pool))]
+    theta = theta_base + rng.randrange(2) * math.pi
+    s = fit_to_convex(src, theta, rel)
+    h = src["height"] if height is None else height
+    kz = h / src["height"] if src["height"] > 0 else 1.0
+    P_ = Matrix.Translation((cen.x, cen.y, z)) @ Matrix.Rotation(theta, 4, 'Z')
+    Sc = Matrix.Diagonal(Vector((s, s, kz, 1.0)))
+    T = Matrix.Translation(-src["bottom_center"])
+    return {"group": group, "cat": cat, "layer": layer, "src": src, "height": h,
+            "matrix": P_ @ Sc @ T @ src["obj"].matrix_world}
+
+
+def _pen_ccw(pts):
+    n = len(pts)
+    area2 = sum(pts[i].x * pts[(i + 1) % n].y - pts[(i + 1) % n].x * pts[i].y for i in range(n))
+    return list(pts) if area2 >= 0 else list(reversed(pts))
+
+
+def _pen_key(q):
+    return (round(q.x, 4), round(q.y, 4))
+
+
+def _pen_edge_key(a, b):
+    return tuple(sorted((_pen_key(a), _pen_key(b))))
+
+
+def _pen_angle(v, vn, vp):
+    """Interior angle in degrees at corner v between its two edges."""
+    u = (vn - v).normalized()
+    w = (vp - v).normalized()
+    return math.degrees(math.acos(max(-1.0, min(1.0, u.dot(w)))))
+
+
+def _pen_inside(pts, q, margin=0.0):
+    """True when q is inside the counter-clockwise convex polygon pts, at least margin from every edge."""
+    n = len(pts)
+    for i in range(n):
+        a, b = pts[i], pts[(i + 1) % n]
+        d = b - a
+        nrm = Vector((d.y, -d.x)).normalized()
+        if (q - a).dot(nrm) > -margin:
+            return False
+    return True
+
+
+def _pen_ribbon(bm, a, b, w, z):
+    """A flat strip of width w from a to b, at height z."""
+    d = b - a
+    if d.length < 1e-9:
+        return
+    n = Vector((-d.normalized().y, d.normalized().x)) * (w / 2.0)
+    quad = [a + n, b + n, b - n, a - n]
+    verts = [bm.verts.new((q.x, q.y, z)) for q in quad]
+    try:
+        bm.faces.new(verts)
+    except ValueError:
+        pass
+
+
+def _pen_pentagon(c, r):
+    return [Vector((c.x + r * math.cos(math.radians(90 + 72 * k)), c.y + r * math.sin(math.radians(90 + 72 * k))))
+            for k in range(5)]
+
+
+def _pen_shaft(t, ci, S):
+    """A parallelogram shaft in the wide corner ci of a thin tile: S along each of the two edges that meet there."""
+    pts = t["pts"]
+    n = len(pts)
+    V = pts[ci]
+    u = (pts[(ci + 1) % n] - V).normalized() * S
+    w = (pts[(ci - 1) % n] - V).normalized() * S
+    return _pen_ccw([V, V + u, V + u + w, V + w])
+
+
+def pen_tree_spots(t, n, rng, L):
+    """Up to n tree positions inside one tile, kept clear of its edges, with canopies apart. Returns (position, scale)."""
+    spots = []
+    cr_max = TREE_RADIUS_FRAC * getattr(L, "TREE_S", L.S) * 1.15 * getattr(L, "TREE_SCALE", 1.0)
+    xs = [q.x for q in t["pts"]]
+    ys = [q.y for q in t["pts"]]
+    for _ in range(n * 40):
+        if len(spots) >= n:
+            break
+        pos = Vector((rng.uniform(min(xs), max(xs)), rng.uniform(min(ys), max(ys))))
+        if not _pen_inside(t["pts"], pos, cr_max + 0.5):
+            continue
+        scale = rng.uniform(0.85, 1.15) * getattr(L, "TREE_SCALE", 1.0)
+        if all((pos - q).length >= 2.2 * cr_max for q, _ in spots):
+            spots.append((pos, scale))
+    return spots
+
+
+def pen_bench_spots(t, n, trees, rng, L):
+    """Up to n bench positions inside one tile, clear of the trees and of its edges. Returns (position, angle)."""
+    spots = []
+    xs = [q.x for q in t["pts"]]
+    ys = [q.y for q in t["pts"]]
+    for _ in range(n * 40):
+        if len(spots) >= n:
+            break
+        pos = Vector((rng.uniform(min(xs), max(xs)), rng.uniform(min(ys), max(ys))))
+        if not _pen_inside(t["pts"], pos, 2.0):
+            continue
+        clear = all((pos - tp).length >= TREE_RADIUS_FRAC * getattr(L, "TREE_S", L.S) * sc + 2.5 for tp, sc in trees)
+        clear = clear and all((pos - q).length >= 3.0 for q, _ in spots)
+        if clear:
+            spots.append((pos, rng.random() * math.tau))
+    return spots
+
+
+
+
+def _pen_strip(t, width):
+    """The road of a thin tile: a 12 ft strip along its long diagonal, from one 36-degree vertex to the other. It
+    may cut a little into the towers beside it."""
+    A = t["pts"][t["acute"][0]]
+    B = t["pts"][t["acute"][1]]
+    u = (B - A).normalized()
+    off = 0.0                                  # the road runs from vertex to vertex
+    a = A + u * off
+    b = B - u * off
+    n = Vector((-u.y, u.x)) * (width / 2.0)
+    quad = _pen_ccw([a + n, b + n, b - n, a - n])
+    cen = sum(quad, Vector((0.0, 0.0))) / 4.0
+    rel = [q - cen for q in quad]
+    t["road_pts"] = quad
+    t["road_cen"] = cen
+    t["road_rel"] = rel
+    t["road_theta"] = math.atan2(rel[1].y - rel[0].y, rel[1].x - rel[0].x)
+
+
+def build_penrose_city(p, fp=None, index=0):
+    """The Penrose city: thick tiles are towers, thin tiles are roads, with roofs, walls, parks, trees, benches,
+    paths, columns and elevator shafts. Returns (buckets, stats, records) like the other shapes."""
+    if fp is None:
+        raise RuntimeError("This arcology has no footprint mesh")
+    L = pen_layout(p)
+    seed = p.seed + index
+    height_at, lo, hi = mesh_height_tester(fp)
+    inside = lambda x, y: height_at(x, y) is not None
+    rng = random.Random(seed)
+    copy_rng = random.Random(seed * 7919 + 21)
+    roof_rng = random.Random(seed * 7919 + 22)
+    road_rng = random.Random(seed * 7919 + 24)
+    elev_rng = random.Random(seed * 7919 + 23)
+    tower_src = source_pool(p.coll_thick_rhombs)
+    road_src = source_pool(p.coll_thin_rhombs)
+    thick_roof_src = source_pool(p.coll_thick_roofs)
+    thin_roof_src = source_pool(p.coll_thin_roofs)
+    thick_park_src = source_pool(p.coll_thick_parks)
+    thin_park_src = source_pool(p.coll_thin_parks)
+    wall_src = source_pool(p.coll_walls)
+    elev_src = source_pool(p.coll_elevators)
+    records = []
+
+    # Each seed gives a slightly different placement of the tiling on the footprint.
+    shift = PEN_SHIFT + np.array([rng.random(), rng.random(), rng.random()]) * 0.05
+    cx, cy = (lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0
+    reach = math.hypot(hi.x - lo.x, hi.y - lo.y) / 2.0
+    raw = penrose_tiles(reach / L.EDGE + 2.0, shift=shift)
+
+    cap = max(1, p.max_layers)
+    plane = None
+    if p.roof_plane is not None and p.roof_plane.type == 'MESH':
+        plane, _, _ = mesh_height_tester(p.roof_plane)
+    tiles = []
+    for corners, kind in raw:
+        pts_u = corners * L.EDGE + np.array([cx, cy])
+        pts = _pen_ccw([Vector((float(x), float(y))) for x, y in pts_u])
+        cen = sum(pts, Vector((0.0, 0.0))) / 4.0
+        if not inside(cen.x, cen.y):
+            continue
+        rel = [q - cen for q in pts]
+        theta_base = math.atan2(rel[1].y - rel[0].y, rel[1].x - rel[0].x)
+        wide = [i for i in range(4) if _pen_angle(pts[i], pts[(i + 1) % 4], pts[i - 1]) > 90.0]
+        acute = [i for i in range(4) if _pen_angle(pts[i], pts[(i + 1) % 4], pts[i - 1]) < 90.0]
+        if plane is None:
+            n = cap
+        else:
+            z = plane(cen.x, cen.y)
+            n = 1 if z is None else layers_under(z, L)
+        tiles.append({"pts": pts, "rel": rel, "cen": cen, "theta": theta_base, "kind": kind,
+                      "hmax": max(1, min(cap, n)), "wide": wide, "acute": acute})
+    if not tiles:
+        raise RuntimeError("No Penrose tiles fall inside the footprint.")
+    for t in tiles:
+        if t["kind"] == 'thin' and len(t["wide"]) == 2 and len(t["acute"]) == 2:
+            _pen_strip(t, p.road_width_ft * FT)
+
+    tmin, tmax = sorted((p.tower_min, p.tower_max))
+    for t in tiles:
+        if t["kind"] == 'thick':
+            t["top"] = min(rng.randint(max(1, tmin), max(1, tmax)), t["hmax"])
+        else:
+            t["top"] = t["hmax"]
+
+    buckets = {}
+
+    def bucket(cat, layer):
+        k = (cat, layer)
+        if k not in buckets:
+            buckets[k] = bmesh.new()
+        return buckets[k]
+
+    P = L.PITCH
+    H_ = L.HEX_H
+
+    def roof(t, z0, z1, layer):
+        pool = thick_roof_src if t["kind"] == 'thick' else thin_roof_src
+        if pool:
+            records.append(rhomb_record(pool, roof_rng, t["cen"], t["theta"], t["rel"], z0, z1 - z0, layer,
+                                        "Roof", "roofs"))
+        else:
+            add_prism(bucket("roofs", layer), t["pts"], z0, z1)
+
+    # Ground: a tile under every tile. The roads of the thin tiles are raised strips on top of it.
+    for t in tiles:
+        add_prism(bucket("tiles", 1), t["pts"], TILE_BOT, TILE_TOP)
+
+    # Towers: a module on each level of every thick tile, with a roof above each module.
+    if p.show_towers:
+        for t in tiles:
+            if t["kind"] != 'thick':
+                continue
+            for k in range(t["top"] - 1):
+                z = TILE_TOP + k * P
+                if tower_src:
+                    records.append(rhomb_record(tower_src, copy_rng, t["cen"], t["theta"], t["rel"], z, H_, k + 1,
+                                                "Thick Rhombs", "towers"))
+                else:
+                    add_prism(bucket("towers", k + 1), t["pts"], z, z + H_)
+                roof(t, z + H_, z + P, k + 2)
+
+    # Roads: a surface on each thin tile at ground level, and a roof over each road level above it.
+    if p.show_roads:
+        for t in tiles:
+            if t["kind"] != 'thin':
+                continue
+            for k in range(max(1, t["top"] - 1)):
+                z = ROAD_BASE + k * P
+                if road_src:
+                    records.append(rhomb_record(road_src, road_rng, t["road_cen"], t["road_theta"], t["road_rel"],
+                                                z, ROAD_H, k + 1, "Thin Rhombs", "road_rectangles"))
+                else:
+                    add_prism(bucket("road_rectangles", k + 1), t["road_pts"], z, z + ROAD_H)
+            for k in range(t["top"] - 1):
+                roof(t, ROAD_BASE + k * P + H_, ROAD_BASE + (k + 1) * P, k + 2)
+
+    # Elevators: two shafts in the wide corners of each chosen thin tile, one per level. Chosen tiles are at least
+    # Elevator Distance apart, centre to centre, picked in a random order from the seed.
+    elev_count = 0
+    if p.show_elevators:
+        cand = [i for i, t in enumerate(tiles) if t["kind"] == 'thin' and len(t["wide"]) == 2]
+        elev_rng.shuffle(cand)
+        chosen = []
+        for i in cand:
+            c = tiles[i]["cen"]
+            if all((c - tiles[j]["cen"]).length >= p.elevator_distance for j in chosen):
+                chosen.append(i)
+        elev_h = ELEVATOR_H_FT * FT
+        S = PEN_ELEV_SHAFT_FT * FT
+        for i in chosen:
+            t = tiles[i]
+            for ci in t["wide"]:
+                shaft = _pen_shaft(t, ci, S)
+                scen = sum(shaft, Vector((0.0, 0.0))) / 4.0
+                srel = [q - scen for q in shaft]
+                sth = math.atan2(srel[1].y - srel[0].y, srel[1].x - srel[0].x)
+                for k in range(t["top"]):
+                    z = ROAD_BASE + k * P
+                    if elev_src:
+                        records.append(rhomb_record(elev_src, elev_rng, scen, sth, srel, z, elev_h, k + 1,
+                                                    "Elevators", "elevators"))
+                    else:
+                        add_prism(bucket("elevators", k + 1), shaft, z, z + elev_h)
+                elev_count += 1
+
+    # Walls: on every edge of a thick tile that has no neighbour, or a neighbour with fewer levels.
+    edge_map = {}
+    for idx, t in enumerate(tiles):
+        for i in range(4):
+            edge_map.setdefault(_pen_edge_key(t["pts"][i], t["pts"][(i + 1) % 4]), []).append(idx)
+    walls = 0
+    if p.show_walls:
+        for idx, t in enumerate(tiles):
+            ta = t["top"]
+            base = TILE_TOP if t["kind"] == 'thick' else ROAD_BASE
+            for i in range(4):
+                a, b = t["pts"][i], t["pts"][(i + 1) % 4]
+                others = [j for j in edge_map[_pen_edge_key(a, b)] if j != idx]
+                tb = tiles[others[0]]["top"] if others else 0
+                if others and t["kind"] == 'thin':
+                    continue    # roads open onto the tiles beside them
+                if tb >= ta:
+                    continue
+                d = b - a
+                nout = Vector((d.y, -d.x)).normalized()
+                if nout.dot(t["cen"] - a) > 0:
+                    nout = -nout
+                quad = [a, b, b - nout * L.WALL_T, a - nout * L.WALL_T]
+                wc = (a + b) / 2.0 - nout * (L.WALL_T / 2.0)
+                wang = math.degrees(math.atan2(nout.y, nout.x))
+                for k in range(max(tb - 1, 0), ta - 1):
+                    z = base + k * P
+                    if wall_src:
+                        records.append(wall_record(wall_src, copy_rng, wc, wang, z, H_, k + 1, L,
+                                                   length=d.length, thick=L.WALL_T))
+                    else:
+                        add_prism(bucket("walls", k + 1), quad, z, z + H_)
+                    walls += 1
+
+    # Parks: on the top level of each thick tile, and on each thin road tile with two levels or more.
+    parks = 0
+    placed = {}                                     # tile index -> (top layer, surface height)
+    if p.show_parks:
+        for idx, t in enumerate(tiles):
+            if t["kind"] == 'thick':
+                zb, Hp = TILE_TOP, t["top"]
+            else:
+                if t["top"] < 2:
+                    continue
+                zb, Hp = ROAD_BASE, t["top"]
+            if rng.random() > p.park_density:
+                continue
+            z_base = zb + (Hp - 1) * P
+            pool = thick_park_src if t["kind"] == 'thick' else thin_park_src
+            if pool:
+                rec = rhomb_record(pool, copy_rng, t["cen"], t["theta"], t["rel"], z_base, None, Hp,
+                                   "Parks", "parks")
+                records.append(rec)
+                slab_h = rec["height"]
+            else:
+                add_prism(bucket("parks", Hp), t["pts"], z_base, z_base + PARK_SLAB_H)
+                slab_h = PARK_SLAB_H
+            placed[idx] = (Hp, z_base + slab_h)
+            parks += 1
+
+    # Trees and benches on the parks.
+    tree_count = 0
+    bench_count = 0
+    if placed and (p.show_trees or p.show_benches):
+        for idx, (Hp, zs) in placed.items():
+            t = tiles[idx]
+            trees = pen_tree_spots(t, p.trees_per_cell, rng, L) if p.show_trees and p.tree_scale > 0 else []
+            for pos, sc in trees:
+                add_tree(bucket("trunks", Hp), bucket("canopies", Hp), pos, zs, sc, L)
+                tree_count += 1
+            if p.show_benches:
+                for pos, th_b in pen_bench_spots(t, p.benches_per_cell, trees, rng, L):
+                    add_bench(bucket("benches", Hp), pos, th_b, zs, L)
+                    bench_count += 1
+
+    # Roof paths: from each park's centre out to the edge midpoint of every neighbouring park on the same level.
+    if p.show_paths and placed:
+        w = PATH_WIDTH_FT * FT
+        for idx, (Hp, zs) in placed.items():
+            t = tiles[idx]
+            zp = zs + PATH_LIFT_FT * FT
+            bk = bucket("paths", Hp)
+            sides = []
+            for i in range(4):
+                a, b = t["pts"][i], t["pts"][(i + 1) % 4]
+                others = [j for j in edge_map[_pen_edge_key(a, b)] if j != idx]
+                j = others[0] if others else None
+                if j is not None and j in placed and placed[j][0] == Hp and abs(placed[j][1] - zs) < 1e-6:
+                    sides.append(i)
+            if sides:
+                for i in sides:
+                    _pen_ribbon(bk, t["cen"], (t["pts"][i] + t["pts"][(i + 1) % 4]) / 2.0, w, zp)
+            else:
+                i = rng.randrange(4)
+                for i2 in (i, (i + 2) % 4):
+                    a, b = t["pts"][i2], t["pts"][(i2 + 1) % 4]
+                    _pen_ribbon(bk, t["cen"], (a + b) / 2.0, w, zp)
+
+    # Columns: a 3 ft pentagon at every tile corner, one per level of the tallest tile on that corner.
+    if p.show_columns:
+        corner_site = {}
+        for t in tiles:
+            base = TILE_TOP if t["kind"] == 'thick' else ROAD_BASE
+            for q in t["pts"]:
+                key = _pen_key(q)
+                cur = corner_site.get(key)
+                if cur is None or t["top"] > cur[1]:
+                    corner_site[key] = (q, t["top"], base)
+        for q, layers, base in corner_site.values():
+            pent = _pen_pentagon(q, PEN_COLUMN_R)
+            for k in range(max(0, layers - 1)):
+                add_prism(bucket("columns", k + 1), pent, base + k * P, base + (k + 1) * P)
+
+    thick = [t for t in tiles if t["kind"] == 'thick']
+    stats = {
+        "footprint": len(tiles),
+        "thick": len(thick),
+        "cells_counted": sum(max(0, t["top"] - 1) for t in thick),
+        "towers": len(thick),
+        "transport": elev_count,
+        "elevators": elev_count,
+        "walls": walls,
+        "parks": parks,
+        "trees": tree_count,
+        "benches": bench_count,
+        "top_layer": max(t["top"] for t in tiles),
+    }
+    return buckets, stats, records
+
+
+# ---------------------------------------------------------------------------
 # Output objects
 # ---------------------------------------------------------------------------
 def material_for(cat):
@@ -1761,40 +2721,26 @@ def output_collection(scene):
     return root
 
 
-def child_collection(root, name):
-    """A collection under the output root. Only collections this add-on made are reused, so a
-    collection of yours with the same name is never touched."""
-    coll = bpy.data.collections.get(name)
-    if coll is None or not coll.get(PROXY_TAG):
-        coll = bpy.data.collections.new(name)
-        coll[PROXY_TAG] = True
-    if coll.name not in [c.name for c in root.children]:
-        root.children.link(coll)
+ROLE_KEY = "arcology_role"
+
+
+def child_collection(root, role):
+    """The add-on collection for one role (a layer, the walls, a group) under root. Found by its role tag,
+    so it is reused between rebuilds, and each footprint's root keeps its own. Your collections are never used."""
+    for c in root.children:
+        if c.get(PROXY_TAG) and c.get(ROLE_KEY) == role:
+            return c
+    name = role if root.name == OUTPUT_COLLECTION else f"{role} ({root.name})"
+    coll = bpy.data.collections.new(name)
+    coll[PROXY_TAG] = True
+    coll[ROLE_KEY] = role
+    root.children.link(coll)
     return coll
-
-
-GROUP_PROP = {"Hexagons": "coll_hexagons", "Road Trapezoids": "coll_trapezoids", "Parks": "coll_parks",
-              "Walls": "coll_walls", "Roof": "coll_roof", "Elevators": "coll_elevators"}
-
-
-def target_collection(scene, root, group):
-    """The collection picked in the Collections box for this group, or a collection the add-on makes."""
-    chosen = getattr(scene.arcology_props, GROUP_PROP[group])
-    if chosen is not None:
-        return chosen
-    return child_collection(root, group)
 
 
 def layer_collection(root, layer):
-    """The 'Layer N' collection under the output root. Reused between rebuilds, so the outliner keeps its state."""
-    name = f"Layer {layer}"
-    coll = bpy.data.collections.get(name)
-    if coll is None or not coll.get(PROXY_TAG):
-        coll = bpy.data.collections.new(name)
-        coll[PROXY_TAG] = True
-    if coll.name not in [c.name for c in root.children]:
-        root.children.link(coll)
-    return coll
+    """The 'Layer N' collection under root. Reused between rebuilds, so the outliner keeps its state."""
+    return child_collection(root, f"Layer {layer}")
 
 
 def prune_output_collections():
@@ -1806,8 +2752,7 @@ def prune_output_collections():
         bpy.data.batch_remove(empty)
 
 
-def write_output(scene, buckets):
-    root = output_collection(scene)
+def write_output(root, buckets):
     count = 0
     for (cat, layer), bm in sorted(buckets.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         if cat == "walls":
@@ -1837,48 +2782,110 @@ def bmesh_normals(me):
     bm.free()
 
 
-def rebuild(scene):
-    """Clears the old proxy city and builds the city of the tab showing, from that tab's slider values."""
-    hexp = scene.arcology_props                  # also holds the shared Live switch and status line
-    t0 = time.perf_counter()
-    if scene.arcology_shape == SHAPE_RECT:
-        hexp.status = "Rectangle is under construction"
+def active_entry(scene):
+    """The arcology the panel is showing, or None when the list is empty."""
+    if not scene.arcologies:
         return None
-    if scene.arcology_shape == SHAPE_OCT:
-        q = scene.arcology_octagon
-        buckets, stats, records = build_octagon_city(q)
-        q.last_footprint = stats["footprint"]
-        q.last_cell_count = stats["cells_counted"]    # every level except junctions and the park layer
-        summary = (f"{stats['footprint']} octagons, {stats['squares']} squares, top layer {stats['top_layer']}, "
-                   f"{stats['towers']} towers, {stats['walls']} walls, {stats['parks']} park cells, "
-                   f"{stats['trees']} trees, {stats['benches']} benches")
+    index = min(max(scene.arcology_index, 0), len(scene.arcologies) - 1)
+    return scene.arcologies[index]
+
+
+def ensure_uids(scene):
+    """Gives every arcology an id that stays with it while it is in the list. Its output lives under that id."""
+    next_id = max((e.uid for e in scene.arcologies), default=0) + 1
+    for e in scene.arcologies:
+        if e.uid == 0:
+            e.uid = next_id
+            next_id += 1
+
+
+def arcology_role(entry):
+    """The name of the output collection of one arcology. Keyed by its id, so it stays put when the list changes."""
+    return f"Arcology {entry.uid}"
+
+
+def find_child(root, role):
+    for c in root.children:
+        if c.get(PROXY_TAG) and c.get(ROLE_KEY) == role:
+            return c
+    return None
+
+
+def clear_arcology(entry):
+    """Removes the proxy objects of this one arcology. The rest of the output is left alone."""
+    root = bpy.data.collections.get(OUTPUT_COLLECTION)
+    sub = find_child(root, arcology_role(entry)) if root is not None else None
+    if sub is None:
+        return
+    doomed = list(sub.all_objects)
+    meshes = list({ob.data for ob in doomed if ob.type == 'MESH' and ob.data is not None})
+    if doomed:
+        bpy.data.batch_remove(doomed)
+    spare = [me for me in meshes if me.users == 0]
+    if spare:
+        bpy.data.batch_remove(spare)
+    prune_output_collections()
+
+
+def rebuild(scene, entry):
+    """Clears and rebuilds one arcology: the selected one. The other arcologies in the list are not touched."""
+    shared = scene.arcology_shared               # also holds the shared Live switch and status line
+    t0 = time.perf_counter()
+    if entry is None:
+        shared.status = "Add an arcology with +"
+        return None
+    ensure_uids(scene)
+    number = next((i + 1 for i, e in enumerate(scene.arcologies) if e.uid == entry.uid), 0)
+    clear_arcology(entry)
+    fp = entry.footprint
+    if fp is None or fp.type != 'MESH':
+        shared.status = f"Arcology {number}: no footprint. Pick a mesh for it first"
+        return None
+    is_rect = entry.shape == SHAPE_RECT
+    is_oct = entry.shape == SHAPE_OCT
+    props = {SHAPE_PEN: entry.penrose_settings, SHAPE_RECT: entry.rect_settings,
+             SHAPE_OCT: entry.oct_settings}.get(entry.shape, entry.hex_settings)
+    target = child_collection(output_collection(scene), arcology_role(entry))
+    if entry.shape == SHAPE_PEN:
+        buckets, stats, records = build_penrose_city(props, fp, number - 1)
+        props.last_footprint = stats["footprint"]
+        props.last_thick = stats["thick"]
+        props.last_cell_count = stats["cells_counted"]
+        footprint, unit = stats["footprint"], "tiles"
+    elif is_rect:
+        buckets, stats, records = build_rect_city(props, fp, number - 1)
+        props.last_footprint = stats["footprint"]
+        props.last_cell_count = stats["cells_counted"]
+        footprint, unit = stats["footprint"], "rectangles"
+    elif is_oct:
+        buckets, stats, records = build_octagon_city(props, fp, number - 1)
+        props.last_footprint = stats["footprint"]
+        props.last_cell_count = stats["cells_counted"]
+        footprint, unit = stats["footprint"], "octagons"
     else:
-        buckets, stats, records = build_city(hexp)
-        hexp.last_footprint = stats["hexes"]
-        hexp.last_hex_count = stats["cells_counted"]      # every level except transport hexes and the park layer
-        summary = (f"{stats['hexes']} hexes, top layer {stats['top_layer']}, "
-                   f"{stats['towers']} towers, {stats['walls']} walls, {stats['parks']} park cells, "
-                   f"{stats['trees']} trees, {stats['benches']} benches")
-    clear_output(prune=False)
-    n_objects = write_output(scene, buckets) + write_copies(scene, records)
+        buckets, stats, records = build_city(props, fp, number - 1)
+        props.last_footprint = stats["hexes"]
+        props.last_hex_count = stats["cells_counted"]
+        footprint, unit = stats["hexes"], "hexes"
+    n_objects = write_output(target, buckets) + write_copies(target, records)
     prune_output_collections()
     dt = (time.perf_counter() - t0) * 1000.0
-    hexp.status = f"{summary}, {n_objects} objects, {dt:.0f} ms"
-    return stats
+    shared.status = (f"Arcology {number}: {footprint} {unit} across the footprint, top layer {stats['top_layer']}, "
+                     f"{stats['towers']} towers, {stats['walls']} walls, {stats['parks']} park cells, "
+                     f"{stats['trees']} trees, {stats['benches']} benches, {n_objects} objects, {dt:.0f} ms")
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Live updates
-# ---------------------------------------------------------------------------
 def _timer_fire():
     global _pending
     _pending = False
+    scene = bpy.context.scene
     try:
-        rebuild(bpy.context.scene)
+        rebuild(scene, active_entry(scene))    # live: only the arcology the panel shows
     except Exception as exc:                       # keep the add-on alive; show the error in the panel
         traceback.print_exc()
         try:
-            bpy.context.scene.arcology_props.status = f"Error: {exc}"
+            scene.arcology_shared.status = f"Error: {exc}"
         except Exception:
             pass
     return None                                    # run once
@@ -1893,19 +2900,19 @@ def schedule_rebuild(delay=0.15):
     bpy.app.timers.register(_timer_fire, first_interval=delay)
 
 
-def _auto_rebuild(shape):
-    """Schedules a live rebuild, but only when the tab for this shape is the one showing."""
+def _auto_rebuild():
+    """Schedules a live rebuild while the Live switch is on. Any arcology's change rebuilds them all."""
     scene = bpy.context.scene
-    if scene is not None and scene.arcology_props.live and scene.arcology_shape == shape:
+    if scene is not None and scene.arcology_shared.live:
         schedule_rebuild()
 
 
 def _on_change(self, context):
-    _auto_rebuild(SHAPE_HEX)
+    _auto_rebuild()
 
 
 def _on_oct_change(self, context):
-    _auto_rebuild(SHAPE_OCT)
+    _auto_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -1939,14 +2946,9 @@ def _set_hex_edge_shown(props, value):
 
 
 class ArcologyProps(PropertyGroup):
-    footprint: PointerProperty(
-        name="Footprint", type=bpy.types.Object, poll=_is_mesh, update=_on_change,
-        description="The mesh the arcology is built on. Leave empty to use 'Ark Polygon' or '30 Acre Ark'")
     roof_plane: PointerProperty(
         name="Roof Plane", type=bpy.types.Object, poll=_is_mesh, update=_on_change,
         description="Optional. Its height above each hex sets that hex's layer count, so it can be sculpted")
-    live: BoolProperty(name="Live update", default=True,
-                       description="Rebuild a moment after every change")
     seed: IntProperty(name="Seed", default=42, min=0, max=999999, update=_on_change)
     hex_edge: FloatProperty(name="Hex edge length", default=33.35 / math.sqrt(3.0),
                             min=10.0 / math.sqrt(3.0), max=80.0 / math.sqrt(3.0), update=_on_change,
@@ -1991,6 +2993,9 @@ class ArcologyProps(PropertyGroup):
     min_cells_between_roads: IntProperty(
         name="Min Cells Between Roads", default=1, min=0, max=12, update=_on_change,
         description="The fewest rows or columns of hexes that must sit between two roads, so roads are never back to back")
+    tree_scale: FloatProperty(
+        name="Tree Scale", default=1.0, min=0.0, max=3.0, update=_on_change,
+        description="Scales every tree, its canopy and its trunk. 0 hides the trees, 3 is three times the size")
     park_density: FloatProperty(name="Park density", default=0.8, min=0.0, max=1.0, subtype='FACTOR',
                                 update=_on_change, description="Chance that a roof site gets a park")
     show_towers: BoolProperty(name="Towers", default=True, update=_on_change)
@@ -2043,7 +3048,6 @@ class ArcologyProps(PropertyGroup):
     stat_mortgage_rate: FloatProperty(name="Mortgage Rate", default=7.0, min=0.0, max=30.0, precision=2,
                                       subtype='PERCENTAGE',
                                       description="Annual mortgage interest rate. The loan is a 30-year fixed mortgage")
-    status: bpy.props.StringProperty(name="Status", default="Not built yet")
 
 
 def _set_oct_edge_shown(props, value):
@@ -2054,9 +3058,6 @@ def _set_oct_edge_shown(props, value):
 
 class OctagonProps(PropertyGroup):
     """Settings for the octagon city. Kept apart from the hexagon settings, so each city has its own values."""
-    footprint: PointerProperty(
-        name="Footprint", type=bpy.types.Object, poll=_is_mesh, update=_on_oct_change,
-        description="The mesh the octagon city is built on. Leave empty to use 'Ark Polygon' or '30 Acre Ark'")
     roof_plane: PointerProperty(
         name="Roof Plane", type=bpy.types.Object, poll=_is_mesh, update=_on_oct_change,
         description="Optional. Its height above each octagon sets that octagon's layer count, so it can be sculpted")
@@ -2102,6 +3103,9 @@ class OctagonProps(PropertyGroup):
     min_cells_between_roads: IntProperty(
         name="Min Cells Between Roads", default=1, min=0, max=12, update=_on_oct_change,
         description="The fewest rows or columns of octagons that must sit between two roads, so roads are never back to back")
+    tree_scale: FloatProperty(
+        name="Tree Scale", default=1.0, min=0.0, max=3.0, update=_on_oct_change,
+        description="Scales every tree, its canopy and its trunk. 0 hides the trees, 3 is three times the size")
     park_density: FloatProperty(name="Park density", default=0.8, min=0.0, max=1.0, subtype='FACTOR',
                                 update=_on_oct_change, description="Chance that a roof site gets a park")
     show_towers: BoolProperty(name="Towers", default=True, update=_on_oct_change)
@@ -2134,8 +3138,11 @@ class OctagonProps(PropertyGroup):
         name="Walls", type=bpy.types.Collection, update=_on_oct_change,
         description="Objects in this collection are copied onto the exposed sides as walls. Empty = generated walls")
     coll_roof: PointerProperty(
-        name="Roof", type=bpy.types.Collection, update=_on_oct_change,
-        description="Objects in this collection are copied onto the roofs. Empty = generated roofs")
+        name="Octagon Roofs", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied onto the octagon roofs. Empty = generated roofs")
+    coll_square_roofs: PointerProperty(
+        name="Square Roofs", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied onto the square roofs. Empty = generated roofs")
     coll_elevators: PointerProperty(
         name="Elevators", type=bpy.types.Collection, update=_on_oct_change,
         description="Objects in this collection are copied into the transport octagons. Empty = generated shafts")
@@ -2160,14 +3167,546 @@ class OctagonProps(PropertyGroup):
                                       description="Annual mortgage interest rate. The loan is a 30-year fixed mortgage")
 
 
+def _set_rect_size_shown(props, key, value):
+    """Store a typed or dragged width or length in metres, clamped to 6 to 120 m (20 to 394 ft)."""
+    metres = value * (FT if props.size_in_feet else 1.0)
+    props[key] = min(max(metres, 6.0), 120.0)
+
+
+def _on_rect_change(self, context):
+    _auto_rebuild()
+
+
+class RectProps(PropertyGroup):
+    """Settings for the rectangle city. Kept apart from the other shapes' settings, so each arcology has its own values."""
+    roof_plane: PointerProperty(
+        name="Roof Plane", type=bpy.types.Object, poll=_is_mesh, update=_on_rect_change,
+        description="Optional. Its height above each rectangle sets that rectangle's layer count, so it can be sculpted")
+    seed: IntProperty(name="Seed", default=42, min=0, max=999999, update=_on_rect_change)
+    rect_width: FloatProperty(name="Rectangle width", default=80.0 * FT, min=6.0, max=120.0,
+                              update=_on_rect_change,
+                              description="Width of one rectangle, across the hallway, in metres")
+    rect_length: FloatProperty(name="Rectangle length", default=120.0 * FT, min=6.0, max=120.0,
+                               update=_on_rect_change,
+                               description="Length of one rectangle, along the hallway, in metres")
+    size_in_feet: BoolProperty(name="Feet", default=False,
+                               description="Show the width, length and heights in feet instead of meters")
+    rect_width_shown: FloatProperty(
+        name="Rectangle width", precision=2, min=1.0, max=400.0, update=_on_rect_change,
+        get=lambda self: self.rect_width / (FT if self.size_in_feet else 1.0),
+        set=lambda self, value: _set_rect_size_shown(self, "rect_width", value),
+        description="Width of one rectangle. Shown in the unit picked by the button beside Size")
+    rect_length_shown: FloatProperty(
+        name="Rectangle length", precision=2, min=1.0, max=400.0, update=_on_rect_change,
+        get=lambda self: self.rect_length / (FT if self.size_in_feet else 1.0),
+        set=lambda self, value: _set_rect_size_shown(self, "rect_length", value),
+        description="Length of one rectangle, along the hallway. Shown in the unit picked by the button beside Size")
+    level_ft: FloatProperty(name="Level height (ft)", default=30.0, min=8.0, max=60.0, update=_on_rect_change)
+    roof_ft: FloatProperty(name="Roof height (ft)", default=6.0, min=0.5, max=20.0, update=_on_rect_change)
+    level_shown: FloatProperty(
+        name="Level height", precision=2, min=2.0, max=60.0, update=_on_rect_change,
+        get=lambda self: self.level_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "level_ft", value, 8.0, 60.0),
+        description="Height of one level. Shown in the unit picked by the button beside Size")
+    roof_shown: FloatProperty(
+        name="Roof height", precision=2, min=0.15, max=20.0, update=_on_rect_change,
+        get=lambda self: self.roof_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "roof_ft", value, 0.5, 20.0),
+        description="Height of the roof slab. Shown in the unit picked by the button beside Size")
+    road_width_ft: FloatProperty(name="Road width (ft)", default=20.0, min=6.0, max=60.0, update=_on_rect_change)
+    road_width_shown: FloatProperty(
+        name="Road width", precision=2, min=1.8, max=18.0, update=_on_rect_change,
+        get=lambda self: self.road_width_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "road_width_ft", value, 6.0, 60.0),
+        description="Width of a road. Shown in the unit picked by the button beside Size")
+    max_layers: IntProperty(name="Max layers", default=12, min=1, max=24, update=_on_rect_change,
+                            description="The most layers any rectangle can have")
+    tower_min: IntProperty(name="Tower min layers", default=10, min=1, max=24, update=_on_rect_change)
+    tower_max: IntProperty(name="Tower max layers", default=12, min=1, max=24, update=_on_rect_change)
+    road_chance: FloatProperty(name="Road chance", default=0.12, min=0.0, max=1.0, subtype='FACTOR',
+                               update=_on_rect_change,
+                               description="Chance that a row or column of rectangles is a road")
+    max_cells_between_roads: IntProperty(
+        name="Max Cells Between Roads", default=3, min=1, max=12, update=_on_rect_change,
+        description="The most rows or columns of rectangles that can sit between two roads. A road is forced when reached")
+    min_cells_between_roads: IntProperty(
+        name="Min Cells Between Roads", default=1, min=0, max=12, update=_on_rect_change,
+        description="The fewest rows or columns of rectangles that must sit between two roads, so roads are never back to back")
+    tree_scale: FloatProperty(
+        name="Tree Scale", default=1.0, min=0.0, max=3.0, update=_on_rect_change,
+        description="Scales every tree, its canopy and its trunk. 0 hides the trees, 3 is three times the size")
+    park_density: FloatProperty(name="Park density", default=0.8, min=0.0, max=1.0, subtype='FACTOR',
+                                update=_on_rect_change, description="Chance that a roof site gets a park")
+    show_towers: BoolProperty(name="Towers", default=True, update=_on_rect_change)
+    show_roads: BoolProperty(name="Roads", default=True, update=_on_rect_change)
+    show_parks: BoolProperty(name="Parks", default=True, update=_on_rect_change)
+    show_elevators: BoolProperty(name="Elevators", default=True, update=_on_rect_change)
+    show_walls: BoolProperty(name="Walls", default=True, update=_on_rect_change)
+    show_trees: BoolProperty(name="Trees", default=True, update=_on_rect_change)
+    show_benches: BoolProperty(name="Benches", default=True, update=_on_rect_change)
+    show_columns: BoolProperty(name="Columns", default=True, update=_on_rect_change,
+                               description="3 ft columns at every rectangle corner, one 36 ft column per level")
+    show_paths: BoolProperty(name="Paths", default=True, update=_on_rect_change,
+                             description="4 ft roof paths on the park rectangles, joined to neighbours")
+    coll_rectangles: PointerProperty(
+        name="Rectangles", type=bpy.types.Collection, update=_on_rect_change,
+        description="Objects in this collection are copied to fill the rectangle towers. Empty = generated towers")
+    coll_width_road_rectangles: PointerProperty(
+        name="Width Road Rectangles", type=bpy.types.Collection, update=_on_rect_change,
+        description="Objects in this collection are copied onto the rectangles whose road runs across the width. "
+                    "The road runs along X and the hallway along Y. Stretched to the rectangle. Empty = generated")
+    coll_length_road_rectangles: PointerProperty(
+        name="Length Road Rectangles", type=bpy.types.Collection, update=_on_rect_change,
+        description="Objects in this collection are copied onto the rectangles whose road runs along the length. "
+                    "The road runs along Y and the hallway along X. Stretched to the rectangle. Empty = generated")
+    coll_parks: PointerProperty(
+        name="Parks", type=bpy.types.Collection, update=_on_rect_change,
+        description="Objects in this collection are copied onto the roofs as parks. Empty = generated parks")
+    coll_walls: PointerProperty(
+        name="Walls", type=bpy.types.Collection, update=_on_rect_change,
+        description="Objects in this collection are copied onto the exposed sides as walls. Empty = generated walls")
+    coll_roof: PointerProperty(
+        name="Roof", type=bpy.types.Collection, update=_on_rect_change,
+        description="Objects in this collection are copied onto the roofs. Empty = generated roofs")
+    coll_elevators: PointerProperty(
+        name="Elevators", type=bpy.types.Collection, update=_on_rect_change,
+        description="Objects in this collection are copied into the transport rectangles. Empty = generated shafts")
+    trees_per_cell: IntProperty(name="Trees per park rectangle", default=5, min=0, max=30, update=_on_rect_change,
+                                description="Random trees placed in each park rectangle")
+    benches_per_cell: IntProperty(name="Benches per park rectangle", default=2, min=0, max=30, update=_on_rect_change,
+                                  description="Random benches placed in each park rectangle")
+    last_cell_count: IntProperty(name="Rectangle cells", default=0,
+                                 description="Rectangle cells in the last build, counted at every level, excluding junctions and the park layer (set by Build)")
+    last_footprint: IntProperty(name="Footprint rectangles", default=0,
+                                description="Rectangles across the footprint in the last build (set by Build)")
+    stat_residential: FloatProperty(name="Percent Residential", default=0.6, min=0.0, max=1.0, precision=2,
+                                    description="Share of rectangle cells that are residential, from 0 to 1")
+    stat_residents: IntProperty(name="Residents per rectangle", default=20, min=0,
+                                description="Residents in each residential rectangle cell")
+    stat_cost: FloatProperty(name="Cost Per Rectangle ($M)", default=2.0, min=0.0, precision=2,
+                             description="Build cost of one rectangle cell, in millions of dollars")
+    stat_household: FloatProperty(name="Persons Per Household", default=2.6, min=0.1, max=20.0, precision=1,
+                                  description="Average number of people in each household")
+    stat_mortgage_rate: FloatProperty(name="Mortgage Rate", default=7.0, min=0.0, max=30.0, precision=2,
+                                      subtype='PERCENTAGE',
+                                      description="Annual mortgage interest rate. The loan is a 30-year fixed mortgage")
+
+
+RECT_COLLECTION_INFO = (
+    "Where the origin of your objects matters:",
+    "",
+    "Rectangles: no origin needed. The add-on uses each object's bounding box.",
+    "Width Road Rectangles: put the origin at the centre of the rectangle. The road runs along X (the width) and "
+    "the 12 ft hallway along Y. The object is stretched to the rectangle's width and length.",
+    "Length Road Rectangles: put the origin at the centre of the rectangle. The road runs along Y (the length) and "
+    "the 12 ft hallway along X. The object is stretched to the rectangle's width and length.",
+    "Roof: no origin needed. The add-on uses each object's bounding box.",
+    "Parks: put the origin at the centre of the rectangle it sits on.",
+    "Elevators: put the origin at the centre of the transport rectangle. One copy holds all four shafts.",
+    "Wall exteriors must be facing west, and wall lengths must be facing North/South.",
+    "Heights come from each object's lowest point, so origin height does not matter.",
+)
+
+
+def _draw_rect(layout, entry):
+    """The rectangle arcology: width and length, with its own values and collections."""
+    q = entry.rect_settings
+    unit = "ft" if q.size_in_feet else "m"
+    box = layout.box()
+    row = box.row()
+    row.label(text="Footprint and roof")
+    row.operator("arcology.info", text="", icon='INFO').text = FOOTPRINT_INFO
+    box.prop(entry, "footprint")
+    box.prop(q, "roof_plane")
+
+    box = layout.box()
+    row = box.row()
+    row.label(text="Collections")
+    row.operator("arcology.collection_info", text="", icon='INFO')
+    box.prop(q, "coll_rectangles")
+    box.prop(q, "coll_width_road_rectangles")
+    box.prop(q, "coll_length_road_rectangles")
+    box.prop(q, "coll_parks")
+    box.prop(q, "coll_walls")
+    box.prop(q, "coll_roof")
+    box.prop(q, "coll_elevators")
+
+    box = layout.box()
+    row = box.row()
+    row.label(text="Size")
+    row.prop(q, "size_in_feet", text="ft" if q.size_in_feet else "m", toggle=True)
+    box.prop(q, "rect_width_shown", text=f"Width ({unit})")
+    box.prop(q, "rect_length_shown", text=f"Length ({unit})")
+    box.prop(q, "level_shown", text=f"Level height ({unit})")
+    box.prop(q, "roof_shown", text=f"Roof height ({unit})")
+
+    box = layout.box()
+    box.label(text="Height")
+    box.prop(q, "max_layers")
+    box.prop(q, "tower_min")
+    box.prop(q, "tower_max")
+
+    box = layout.box()
+    box.label(text="Roads and seed")
+    row = box.row(align=True)
+    row.prop(q, "seed")
+    row.operator("arcology.reseed", text="", icon='FILE_REFRESH')
+    box.prop(q, "road_width_shown", text=f"Road width ({unit})")
+    box.prop(q, "road_chance")
+    box.prop(q, "max_cells_between_roads")
+    box.prop(q, "min_cells_between_roads")
+
+    box = layout.box()
+    box.label(text="Show")
+    grid = box.grid_flow(columns=2, align=True)
+    grid.prop(q, "show_towers")
+    grid.prop(q, "show_roads")
+    grid.prop(q, "show_parks")
+    grid.prop(q, "show_elevators")
+    grid.prop(q, "show_walls")
+    grid.prop(q, "show_trees")
+    grid.prop(q, "show_benches")
+    grid.prop(q, "show_columns")
+    grid.prop(q, "show_paths")
+    box.prop(q, "park_density")
+    box.prop(q, "tree_scale")
+    box.prop(q, "trees_per_cell")
+    box.prop(q, "benches_per_cell")
+
+    box = layout.box()
+    box.label(text="Stats")
+    cells = q.last_cell_count
+    if cells:
+        box.label(text=f"Cells, rectangles (every layer, excluding junctions and parks): {cells:,}")
+    else:
+        box.label(text="Cells, rectangles (every layer, excluding junctions and parks): build to count")
+    box.prop(q, "stat_residential")
+    box.prop(q, "stat_residents")
+    box.prop(q, "stat_cost")
+    population = cells * q.stat_residential * q.stat_residents
+    cost_m = cells * q.stat_cost
+    cost_text = f"${cost_m:,.1f} M" if cost_m < 1000 else f"${cost_m / 1000:,.2f} B"
+    box.label(text=f"Estimated Population: {population:,.0f}")
+    box.label(text=f"Estimated Cost: {cost_text}")
+    if q.last_footprint:
+        # Land area: each footprint rectangle, width times length
+        land_m2 = q.last_footprint * q.rect_width * q.rect_length
+        acres = land_m2 / 4046.8564224
+        sq_miles = land_m2 / 2589988.11
+        pop_per_sq_mile = population / sq_miles if sq_miles > 0 else 0.0
+        box.label(text=f"Estimated Land Area: {acres:,.2f} acres")
+        box.label(text=f"Population / square mile: {pop_per_sq_mile:,.0f}")
+        box.label(text=f"Density Compared to Manhattan: {pop_per_sq_mile / MANHATTAN_DENSITY:,.2f}x")
+    else:
+        box.label(text="Estimated Land Area: build to calculate")
+    box.prop(q, "stat_household")
+    box.prop(q, "stat_mortgage_rate")
+    households_per_cell = q.stat_residents / q.stat_household if q.stat_household > 0 else 0.0
+    cost_per_household = (q.stat_cost * 1_000_000.0) / households_per_cell if households_per_cell > 0 else 0.0
+    payment = monthly_mortgage_payment(cost_per_household, q.stat_mortgage_rate)
+    box.label(text=f"Cost per household: ${cost_per_household:,.0f}")
+    box.label(text=f"Estimated Mortgage Payment: ${payment:,.0f} / month")
+
+
+PEN_ELEV_DIST_MAX_M = 1000.0
+
+
+def _set_pen_edge_shown(props, value):
+    """Store a typed or dragged tile edge in metres, clamped to 6 to 60 m."""
+    metres = value * (FT if props.size_in_feet else 1.0)
+    props.tile_edge = min(max(metres, PEN_MIN_EDGE_M), PEN_MAX_EDGE_M)
+
+
+def _set_pen_elev_shown(props, value):
+    """Store a typed or dragged elevator distance in metres, clamped to 0 to 1000 m."""
+    metres = value * (FT if props.size_in_feet else 1.0)
+    props.elevator_distance = min(max(metres, 0.0), PEN_ELEV_DIST_MAX_M)
+
+
+def _on_pen_change(self, context):
+    _auto_rebuild()
+
+
+class PenroseProps(PropertyGroup):
+    """Settings for the Penrose city. Kept apart from the other shapes' settings, so each arcology has its own values."""
+    roof_plane: PointerProperty(
+        name="Roof Plane", type=bpy.types.Object, poll=_is_mesh, update=_on_pen_change,
+        description="Optional. Its height above each tile sets that tile's layer count, so it can be sculpted")
+    seed: IntProperty(name="Seed", default=42, min=0, max=999999, update=_on_pen_change,
+                      description="Changes the tower heights, the placement of the tiling, the elevators and the parks")
+    tile_edge: FloatProperty(name="Tile edge", default=60.0 * FT, min=PEN_MIN_EDGE_M, max=PEN_MAX_EDGE_M,
+                             update=_on_pen_change, description="Length of one edge of a Penrose tile, in metres")
+    elevator_distance: FloatProperty(
+        name="Elevator Distance", default=150.0 * FT, min=0.0, max=PEN_ELEV_DIST_MAX_M, update=_on_pen_change,
+        description="Least distance, in metres, between two thin tiles that both have elevator shafts, measured "
+                    "centre to centre. 0 puts elevators in every thin tile")
+    size_in_feet: BoolProperty(name="Feet", default=False,
+                               description="Show the tile edge, distances and heights in feet instead of metres")
+    tile_edge_shown: FloatProperty(
+        name="Tile edge", precision=2, min=1.0, max=200.0, update=_on_pen_change,
+        get=lambda self: self.tile_edge / (FT if self.size_in_feet else 1.0),
+        set=lambda self, value: _set_pen_edge_shown(self, value),
+        description="Length of one tile edge. Shown in the unit picked by the button beside Size")
+    elevator_distance_shown: FloatProperty(
+        name="Elevator Distance", precision=2, min=0.0, max=3300.0, update=_on_pen_change,
+        get=lambda self: self.elevator_distance / (FT if self.size_in_feet else 1.0),
+        set=lambda self, value: _set_pen_elev_shown(self, value),
+        description="Least centre-to-centre distance between thin tiles with elevators. Shown in the unit picked "
+                    "by the button beside Size")
+    road_width_ft: FloatProperty(name="Road width (ft)", default=12.0, min=6.0, max=60.0, update=_on_pen_change,
+                                 description="Width of each road, along the long diagonal of a thin tile")
+    road_width_shown: FloatProperty(
+        name="Road width", precision=2, min=1.8, max=18.0, update=_on_pen_change,
+        get=lambda self: self.road_width_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "road_width_ft", value, 6.0, 60.0),
+        description="Width of each road. Shown in the unit picked by the button beside Size")
+    level_ft: FloatProperty(name="Level height (ft)", default=30.0, min=8.0, max=60.0, update=_on_pen_change)
+    roof_ft: FloatProperty(name="Roof height (ft)", default=6.0, min=0.5, max=20.0, update=_on_pen_change)
+    level_shown: FloatProperty(
+        name="Level height", precision=2, min=2.0, max=60.0, update=_on_pen_change,
+        get=lambda self: self.level_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "level_ft", value, 8.0, 60.0),
+        description="Height of one level. Shown in the unit picked by the button beside Size")
+    roof_shown: FloatProperty(
+        name="Roof height", precision=2, min=0.15, max=20.0, update=_on_pen_change,
+        get=lambda self: self.roof_ft * (1.0 if self.size_in_feet else FT),
+        set=lambda self, value: _set_height_shown(self, "roof_ft", value, 0.5, 20.0),
+        description="Height of the roof slab. Shown in the unit picked by the button beside Size")
+    max_layers: IntProperty(name="Max layers", default=12, min=1, max=24, update=_on_pen_change,
+                            description="The most layers any tile can have")
+    tower_min: IntProperty(name="Tower min layers", default=10, min=1, max=24, update=_on_pen_change)
+    tower_max: IntProperty(name="Tower max layers", default=12, min=1, max=24, update=_on_pen_change)
+    tree_scale: FloatProperty(
+        name="Tree Scale", default=1.0, min=0.0, max=3.0, update=_on_pen_change,
+        description="Scales every tree, its canopy and its trunk. 0 hides the trees, 3 is three times the size")
+    park_density: FloatProperty(name="Park density", default=0.8, min=0.0, max=1.0, subtype='FACTOR',
+                                update=_on_pen_change, description="Chance that a roof site gets a park")
+    trees_per_cell: IntProperty(name="Trees per park tile", default=5, min=0, max=30, update=_on_pen_change,
+                                description="Random trees placed in each park tile")
+    benches_per_cell: IntProperty(name="Benches per park tile", default=2, min=0, max=30, update=_on_pen_change,
+                                  description="Random benches placed in each park tile")
+    show_towers: BoolProperty(name="Towers", default=True, update=_on_pen_change)
+    show_roads: BoolProperty(name="Roads", default=True, update=_on_pen_change)
+    show_parks: BoolProperty(name="Parks", default=True, update=_on_pen_change)
+    show_walls: BoolProperty(name="Walls", default=True, update=_on_pen_change)
+    show_elevators: BoolProperty(name="Elevators", default=True, update=_on_pen_change)
+    show_trees: BoolProperty(name="Trees", default=True, update=_on_pen_change)
+    show_benches: BoolProperty(name="Benches", default=True, update=_on_pen_change)
+    show_columns: BoolProperty(name="Columns", default=True, update=_on_pen_change,
+                               description="3 ft pentagonal columns at every tile corner, one per level")
+    show_paths: BoolProperty(name="Paths", default=True, update=_on_pen_change,
+                             description="4 ft roof paths on the parks, joined to neighbouring parks")
+    coll_thick_rhombs: PointerProperty(
+        name="Thick Rhombs", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied into the thick tiles as towers. Empty = generated towers")
+    coll_thin_rhombs: PointerProperty(
+        name="Thin Rhombs", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied onto the thin tiles as road surfaces. Empty = generated roads")
+    coll_thick_roofs: PointerProperty(
+        name="Thick Roofs", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied onto the roofs of the thick tiles. Empty = generated roofs")
+    coll_thin_roofs: PointerProperty(
+        name="Thin Roofs", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied onto the roofs of the thin tiles. Empty = generated roofs")
+    coll_thick_parks: PointerProperty(
+        name="Thick Parks", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied onto the thick tiles as parks. Empty = generated parks")
+    coll_thin_parks: PointerProperty(
+        name="Thin Parks", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied onto the thin tiles as parks. Empty = generated parks")
+    coll_walls: PointerProperty(
+        name="Walls", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied onto the exposed edges as walls. Empty = generated walls")
+    coll_elevators: PointerProperty(
+        name="Elevators", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied into the elevator shafts. Empty = generated shafts")
+    last_cell_count: IntProperty(name="Tile cells", default=0,
+                                 description="Thick tile cells in the last build, counted at every level (set by Build)")
+    last_footprint: IntProperty(name="Footprint tiles", default=0,
+                                description="Tiles across the footprint in the last build (set by Build)")
+    last_thick: IntProperty(name="Thick tiles", default=0,
+                            description="Thick tiles in the last build (set by Build)")
+    stat_residential: FloatProperty(name="Percent Residential", default=0.6, min=0.0, max=1.0, precision=2,
+                                    description="Share of thick tile cells that are residential, from 0 to 1")
+    stat_residents: IntProperty(name="Residents per tile", default=20, min=0,
+                                description="Residents in each residential tile cell")
+    stat_cost: FloatProperty(name="Cost Per Tile ($M)", default=2.0, min=0.0, precision=2,
+                             description="Build cost of one tile cell, in millions of dollars")
+    stat_household: FloatProperty(name="Persons Per Household", default=2.6, min=0.1, max=20.0, precision=1,
+                                  description="Average number of people in each household")
+    stat_mortgage_rate: FloatProperty(name="Mortgage Rate", default=7.0, min=0.0, max=30.0, precision=2,
+                                      subtype='PERCENTAGE',
+                                      description="Annual mortgage interest rate. The loan is a 30-year fixed mortgage")
+
+
+PENROSE_COLLECTION_INFO = (
+    "Where the origin of your objects matters:",
+    "",
+    "Thick Rhombs (towers): no origin needed. Each copy is turned to the tile's edge, scaled to fill it and stretched to one level tall.",
+    "Thin Rhombs (roads): no origin needed. Each copy is fitted to the road along the long diagonal, and stretched to the road height.",
+    "Thick Roofs and Thin Roofs: no origin needed. Each copy is turned to the tile's edge, scaled to fill it and stretched to the roof height.",
+    "Thick Parks and Thin Parks: no origin needed. Each copy is turned to the tile's edge, scaled to fill it, and sits on the top level.",
+    "Walls: no origin needed. Each copy is turned out of the tile, its exterior facing west, and stretched to the edge length.",
+    "Elevators: no origin needed. Each copy is fitted to the 14 ft corner shaft and stretched to 36 ft per level.",
+    "Heights come from each object's lowest point, so origin height does not matter.",
+)
+
+
+def _draw_penrose(layout, entry):
+    """The Penrose arcology: tile edge and elevator distance, with its own values and collections."""
+    q = entry.penrose_settings
+    unit = "ft" if q.size_in_feet else "m"
+    box = layout.box()
+    row = box.row()
+    row.label(text="Footprint and roof")
+    row.operator("arcology.info", text="", icon='INFO').text = FOOTPRINT_INFO
+    box.prop(entry, "footprint")
+    box.prop(q, "roof_plane")
+
+    box = layout.box()
+    row = box.row()
+    row.label(text="Collections")
+    row.operator("arcology.collection_info", text="", icon='INFO')
+    box.prop(q, "coll_thick_rhombs")
+    box.prop(q, "coll_thin_rhombs")
+    box.prop(q, "coll_thick_roofs")
+    box.prop(q, "coll_thin_roofs")
+    box.prop(q, "coll_thick_parks")
+    box.prop(q, "coll_thin_parks")
+    box.prop(q, "coll_walls")
+    box.prop(q, "coll_elevators")
+
+    box = layout.box()
+    row = box.row()
+    row.label(text="Size")
+    row.prop(q, "size_in_feet", text="ft" if q.size_in_feet else "m", toggle=True)
+    box.prop(q, "tile_edge_shown", text=f"Tile edge ({unit})")
+    box.prop(q, "elevator_distance_shown", text=f"Elevator Distance ({unit})")
+    box.prop(q, "level_shown", text=f"Level height ({unit})")
+    box.prop(q, "roof_shown", text=f"Roof height ({unit})")
+    box.prop(q, "road_width_shown", text=f"Road width ({unit})")
+
+    box = layout.box()
+    box.label(text="Height")
+    box.prop(q, "max_layers")
+    box.prop(q, "tower_min")
+    box.prop(q, "tower_max")
+
+    box = layout.box()
+    box.label(text="Seed")
+    row = box.row(align=True)
+    row.prop(q, "seed")
+    row.operator("arcology.reseed", text="", icon='FILE_REFRESH')
+
+    box = layout.box()
+    box.label(text="Show")
+    grid = box.grid_flow(columns=2, align=True)
+    grid.prop(q, "show_towers")
+    grid.prop(q, "show_roads")
+    grid.prop(q, "show_parks")
+    grid.prop(q, "show_walls")
+    grid.prop(q, "show_elevators")
+    grid.prop(q, "show_trees")
+    grid.prop(q, "show_benches")
+    grid.prop(q, "show_columns")
+    grid.prop(q, "show_paths")
+    box.prop(q, "park_density")
+    box.prop(q, "tree_scale")
+    box.prop(q, "trees_per_cell")
+    box.prop(q, "benches_per_cell")
+
+    box = layout.box()
+    box.label(text="Stats")
+    cells = q.last_cell_count
+    if cells:
+        box.label(text=f"Cells, thick tiles (every layer, excluding parks): {cells:,}")
+    else:
+        box.label(text="Cells, thick tiles (every layer, excluding parks): build to count")
+    box.prop(q, "stat_residential")
+    box.prop(q, "stat_residents")
+    box.prop(q, "stat_cost")
+    population = cells * q.stat_residential * q.stat_residents
+    cost_m = cells * q.stat_cost
+    cost_text = f"${cost_m:,.1f} M" if cost_m < 1000 else f"${cost_m / 1000:,.2f} B"
+    box.label(text=f"Estimated Population: {population:,.0f}")
+    box.label(text=f"Estimated Cost: {cost_text}")
+    if q.last_footprint:
+        # Land area: each thick tile is sin 72 of an edge squared, each thin tile sin 36
+        thin = q.last_footprint - q.last_thick
+        land_m2 = (q.last_thick * math.sin(math.radians(72.0)) + thin * math.sin(math.radians(36.0))) * q.tile_edge ** 2
+        acres = land_m2 / 4046.8564224
+        sq_miles = land_m2 / 2589988.11
+        pop_per_sq_mile = population / sq_miles if sq_miles > 0 else 0.0
+        box.label(text=f"Estimated Land Area: {acres:,.2f} acres")
+        box.label(text=f"Population / square mile: {pop_per_sq_mile:,.0f}")
+        box.label(text=f"Density Compared to Manhattan: {pop_per_sq_mile / MANHATTAN_DENSITY:,.2f}x")
+    else:
+        box.label(text="Estimated Land Area: build to calculate")
+    box.prop(q, "stat_household")
+    box.prop(q, "stat_mortgage_rate")
+    households_per_cell = q.stat_residents / q.stat_household if q.stat_household > 0 else 0.0
+    cost_per_household = (q.stat_cost * 1_000_000.0) / households_per_cell if households_per_cell > 0 else 0.0
+    payment = monthly_mortgage_payment(cost_per_household, q.stat_mortgage_rate)
+    box.label(text=f"Cost per household: ${cost_per_household:,.0f}")
+    box.label(text=f"Estimated Mortgage Payment: ${payment:,.0f} / month")
+
+
+class ArcologyShared(PropertyGroup):
+    """Settings every arcology shares: the Live switch and the status line."""
+    live: BoolProperty(name="Live update", default=True,
+                       description="Rebuild a moment after every change")
+    status: StringProperty(name="Status", default="Not built yet")
+
+
+SHAPE_LABEL = {SHAPE_HEX: "Hexagon", SHAPE_OCT: "Octagon", SHAPE_RECT: "Rectangle", SHAPE_PEN: "Penrose"}
+
+
+class ArcologyEntry(PropertyGroup):
+    """One arcology: the footprint mesh it is linked to, its shape, and the settings of that shape."""
+    footprint: PointerProperty(
+        name="Footprint", type=bpy.types.Object, poll=_is_mesh, update=_on_change,
+        description="The mesh this arcology is built on")
+    shape: EnumProperty(
+        name="Shape",
+        items=(
+            (SHAPE_HEX, "Hexagon", "A hexagon city on this footprint"),
+            (SHAPE_OCT, "Octagon", "An octagon city, with square gaps, on this footprint"),
+            (SHAPE_RECT, "Rectangle", "A city of touching rectangles, with a 12 ft hallway down each road rectangle"),
+            (SHAPE_PEN, "Penrose", "A city of Penrose tiles: thick tiles are towers, thin tiles are roads"),
+        ),
+        default=SHAPE_HEX, update=_on_change,
+        description="The city this footprint gets")
+    uid: IntProperty(default=0, min=0,
+                     description="Identifies this arcology's output, so it stays put when the list changes")
+    hex_settings: PointerProperty(type=ArcologyProps)
+    oct_settings: PointerProperty(type=OctagonProps)
+    rect_settings: PointerProperty(type=RectProps)
+    penrose_settings: PointerProperty(type=PenroseProps)
+
+
+class ARCOLOGY_UL_list(bpy.types.UIList):
+    """One row per arcology: its number, its footprint and its shape."""
+    bl_idname = "ARCOLOGY_UL_list"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        fp = item.footprint
+        row = layout.row()
+        row.label(text=f"{index + 1}. {fp.name if fp is not None else 'No footprint'}", icon='MESH_DATA')
+        row.label(text=SHAPE_LABEL.get(item.shape, item.shape))
+
+
 class ARCOLOGY_OT_rebuild(Operator):
     bl_idname = "arcology.rebuild"
-    bl_label = "Rebuild"
-    bl_description = "Rebuild the proxy arcology now"
+    bl_label = "Build"
+    bl_description = "Rebuild the selected arcology. It takes the shape on the tabs"
 
     def execute(self, context):
+        scene = context.scene
+        entry = active_entry(scene)
+        if entry is not None and entry.shape != scene.arcology_shape:
+            entry.shape = scene.arcology_shape     # only Build changes an arcology's shape
         try:
-            rebuild(context.scene)
+            rebuild(scene, entry)
         except Exception as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
@@ -2177,23 +3716,61 @@ class ARCOLOGY_OT_rebuild(Operator):
 class ARCOLOGY_OT_clear(Operator):
     bl_idname = "arcology.clear"
     bl_label = "Clear"
-    bl_description = "Remove the proxy arcology"
+    bl_description = "Remove the selected arcology's city. The others are left as they are"
 
     def execute(self, context):
-        clear_output()
-        context.scene.arcology_props.status = "Cleared"
+        entry = active_entry(context.scene)
+        if entry is not None:
+            clear_arcology(entry)
+        context.scene.arcology_shared.status = "Cleared" if entry is not None else "Add an arcology with +"
         return {'FINISHED'}
 
 
 class ARCOLOGY_OT_reseed(Operator):
     bl_idname = "arcology.reseed"
     bl_label = "New seed"
-    bl_description = "Pick a random seed"
+    bl_description = "Pick a random seed for the selected arcology"
+
+    def execute(self, context):
+        entry = active_entry(context.scene)
+        if entry is None:
+            return {'CANCELLED'}
+        props = {SHAPE_PEN: entry.penrose_settings, SHAPE_OCT: entry.oct_settings,
+                 SHAPE_RECT: entry.rect_settings}.get(entry.shape, entry.hex_settings)
+        props.seed = random.randint(0, 999999)
+        return {'FINISHED'}
+
+
+class ARCOLOGY_OT_add(Operator):
+    bl_idname = "arcology.add"
+    bl_label = "Add arcology"
+    bl_description = "Add an arcology. It starts on the active mesh, or on 'Ark Polygon' or '30 Acre Ark'"
 
     def execute(self, context):
         scene = context.scene
-        props = scene.arcology_octagon if scene.arcology_shape == SHAPE_OCT else scene.arcology_props
-        props.seed = random.randint(0, 999999)
+        entry = scene.arcologies.add()
+        ensure_uids(scene)
+        entry.footprint = default_footprint(context)
+        scene.arcology_index = len(scene.arcologies) - 1
+        _auto_rebuild()
+        return {'FINISHED'}
+
+
+class ARCOLOGY_OT_remove(Operator):
+    bl_idname = "arcology.remove"
+    bl_label = "Remove arcology"
+    bl_description = "Remove the selected arcology and its city. The others are left as they are"
+
+    def execute(self, context):
+        scene = context.scene
+        if not scene.arcologies:
+            return {'CANCELLED'}
+        index = min(max(scene.arcology_index, 0), len(scene.arcologies) - 1)
+        clear_arcology(scene.arcologies[index])
+        scene.arcologies.remove(index)
+        scene.arcology_index = max(0, min(index, len(scene.arcologies) - 1))
+        scene.arcology_shared.status = (f"Removed arcology {index + 1}" if scene.arcologies
+                                        else "Add an arcology with +")
         return {'FINISHED'}
 
 
@@ -2215,7 +3792,8 @@ OCT_COLLECTION_INFO = (
     "Octagons: no origin needed. The add-on uses each object's bounding box.",
     "Road Octagons: put the origin at the centre of the octagon cell. The road runs east-west along the object's X axis, and is turned 90 degrees for a north-south road.",
     "Squares: no origin needed. Each copy fills one level of a square tower.",
-    "Roof: no origin needed. The add-on uses each object's bounding box.",
+    "Octagon Roofs: no origin needed. The add-on uses each object's bounding box.",
+    "Square Roofs: no origin needed. The add-on uses each object's bounding box.",
     "Parks: put the origin at the centre of the octagon it sits on.",
     "Elevators: put the origin at the centre of the transport octagon. One copy holds all eight shafts.",
     "Wall exteriors must be facing west, and wall lengths must be facing North/South.",
@@ -2261,7 +3839,10 @@ class ARCOLOGY_Preferences(bpy.types.AddonPreferences):
 MANHATTAN_DENSITY = 75000.0          # people per square mile, for the Stats box comparison
 
 FOOTPRINT_INFO = (
-    "Footprint: sets the X/Y grid the arcology is built on.\n"
+    "Footprint: the mesh this arcology is built on. Each arcology in the list has its own footprint, shape "
+    "and settings, so you can build an octagon and a hexagon side by side, or several hexagons with "
+    "different settings. Press + to add one and - to remove the selected one.\n"
+    "Shape: Hexagon or Octagon for this arcology.\n"
     "Roof plane: Sets the Z axis height above the arcology. I suggest using a subdivided sculpted plane."
 )
 
@@ -2297,7 +3878,14 @@ class ARCOLOGY_OT_collection_info(Operator):
 
     def draw(self, context):
         col = self.layout.column(align=True)
-        lines = OCT_COLLECTION_INFO if context.scene.arcology_shape == SHAPE_OCT else COLLECTION_INFO
+        entry = active_entry(context.scene)
+        is_oct = entry is not None and entry.shape == SHAPE_OCT
+        if entry is not None and entry.shape == SHAPE_PEN:
+            lines = PENROSE_COLLECTION_INFO
+        elif entry is not None and entry.shape == SHAPE_RECT:
+            lines = RECT_COLLECTION_INFO
+        else:
+            lines = OCT_COLLECTION_INFO if is_oct else COLLECTION_INFO
         for line in lines:
             col.label(text=line)
 
@@ -2305,14 +3893,15 @@ class ARCOLOGY_OT_collection_info(Operator):
         return {'FINISHED'}
 
 
-def _draw_oct(layout, q):
-    """The octagon tab. Same layout as the hexagon tab, with its own values."""
+def _draw_oct(layout, entry):
+    """The octagon arcology. Same layout as the hexagon one, with its own values."""
+    q = entry.oct_settings
     unit = "ft" if q.size_in_feet else "m"
     box = layout.box()
     row = box.row()
     row.label(text="Footprint and roof")
     row.operator("arcology.info", text="", icon='INFO').text = FOOTPRINT_INFO
-    box.prop(q, "footprint")
+    box.prop(entry, "footprint")
     box.prop(q, "roof_plane")
 
     box = layout.box()
@@ -2322,6 +3911,7 @@ def _draw_oct(layout, q):
     box.prop(q, "coll_octagons")
     box.prop(q, "coll_road_octagons")
     box.prop(q, "coll_squares")
+    box.prop(q, "coll_square_roofs")
     box.prop(q, "coll_parks")
     box.prop(q, "coll_walls")
     box.prop(q, "coll_roof")
@@ -2334,7 +3924,6 @@ def _draw_oct(layout, q):
     box.prop(q, "oct_edge_shown", text=f"Octagon edge length ({unit})")
     box.prop(q, "level_shown", text=f"Level height ({unit})")
     box.prop(q, "roof_shown", text=f"Roof height ({unit})")
-    box.prop(q, "road_width_shown", text=f"Road width ({unit})")
 
     box = layout.box()
     box.label(text="Height")
@@ -2347,6 +3936,7 @@ def _draw_oct(layout, q):
     row = box.row(align=True)
     row.prop(q, "seed")
     row.operator("arcology.reseed", text="", icon='FILE_REFRESH')
+    box.prop(q, "road_width_shown", text=f"Road width ({unit})")
     box.prop(q, "road_chance")
     box.prop(q, "max_cells_between_roads")
     box.prop(q, "min_cells_between_roads")
@@ -2365,6 +3955,7 @@ def _draw_oct(layout, q):
     grid.prop(q, "show_columns")
     grid.prop(q, "show_paths")
     box.prop(q, "park_density")
+    box.prop(q, "tree_scale")
     box.prop(q, "trees_per_cell")
     box.prop(q, "benches_per_cell")
 
@@ -2404,13 +3995,14 @@ def _draw_oct(layout, q):
     box.label(text=f"Estimated Mortgage Payment: ${payment:,.0f} / month")
 
 
-def _draw_hex(layout, p):
-    """The hexagon tab: the settings it has always had."""
+def _draw_hex(layout, entry):
+    """The hexagon arcology: the settings it has always had, with its own values."""
+    p = entry.hex_settings
     box = layout.box()
     row = box.row()
     row.label(text="Footprint and roof")
     row.operator("arcology.info", text="", icon='INFO').text = FOOTPRINT_INFO
-    box.prop(p, "footprint")
+    box.prop(entry, "footprint")
     box.prop(p, "roof_plane")
 
     box = layout.box()
@@ -2432,7 +4024,6 @@ def _draw_hex(layout, p):
     box.prop(p, "hex_edge_shown", text=f"Hex edge length ({unit})")
     box.prop(p, "level_shown", text=f"Level height ({unit})")
     box.prop(p, "roof_shown", text=f"Roof height ({unit})")
-    box.prop(p, "road_width_shown", text=f"Road width ({unit})")
 
     box = layout.box()
     box.label(text="Height")
@@ -2445,6 +4036,7 @@ def _draw_hex(layout, p):
     row = box.row(align=True)
     row.prop(p, "seed")
     row.operator("arcology.reseed", text="", icon='FILE_REFRESH')
+    box.prop(p, "road_width_shown", text=f"Road width ({unit})")
     box.prop(p, "road_chance")
     box.prop(p, "max_cells_between_roads")
     box.prop(p, "min_cells_between_roads")
@@ -2463,6 +4055,7 @@ def _draw_hex(layout, p):
     grid.prop(p, "show_columns")
     grid.prop(p, "show_paths")
     box.prop(p, "park_density")
+    box.prop(p, "tree_scale")
     box.prop(p, "trees_per_cell")
     box.prop(p, "benches_per_cell")
 
@@ -2512,31 +4105,636 @@ class ARCOLOGY_PT_panel(Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        p = scene.arcology_props
+        shared = scene.arcology_shared
 
         row = layout.row(align=True)
         row.operator("arcology.rebuild", text="Build", icon='FILE_REFRESH')
         row.operator("arcology.clear", text="", icon='X')
-        layout.prop(p, "live")
-        layout.label(text=p.status)
-        layout.prop(scene, "arcology_shape", expand=True)
+        layout.prop(shared, "live")
+        layout.label(text=shared.status)
 
-        if scene.arcology_shape == SHAPE_HEX:
-            _draw_hex(layout, p)
-        elif scene.arcology_shape == SHAPE_OCT:
-            _draw_oct(layout, scene.arcology_octagon)
+        layout.prop(scene, "arcology_shape", expand=True)
+        row = layout.row()
+        row.template_list("ARCOLOGY_UL_list", "", scene, "arcologies", scene, "arcology_index", rows=3)
+        col = row.column(align=True)
+        col.operator("arcology.add", text="", icon='ADD')
+        col.operator("arcology.remove", text="", icon='REMOVE')
+
+        entry = active_entry(scene)
+        if entry is None:
+            layout.label(text="Press + to add an arcology on a footprint.")
+            return
+        if entry.shape == SHAPE_HEX:
+            _draw_hex(layout, entry)
+        elif entry.shape == SHAPE_OCT:
+            _draw_oct(layout, entry)
+        elif entry.shape == SHAPE_PEN:
+            _draw_penrose(layout, entry)
         else:
-            layout.box().label(text="Under Construction")
+            _draw_rect(layout, entry)
+
+
+def _arcology_sidebar(context):
+    """Return (area, region) for the first 3D Viewport that has a sidebar."""
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            for region in area.regions:
+                if region.type == 'UI':
+                    return area, region
+    return None, None
+
+
+def _arcology_sidebar_showing(context):
+    area, region = _arcology_sidebar(context)
+    if area is None:
+        return False
+    return bool(area.spaces.active.show_region_ui) and region.active_panel_category == "Arcology"
+
+
+class ARCOLOGY_OT_open_sidebar(Operator):
+    """Open the Arcology tab in the 3D Viewport sidebar, or close the sidebar if it is already showing it"""
+    bl_idname = "arcology.open_sidebar"
+    bl_label = "Open Arcology Generator"
+    bl_description = "Open the Arcology tab in the 3D Viewport sidebar (N panel), or close it if it is already open"
+
+    def execute(self, context):
+        area, region = _arcology_sidebar(context)
+        if area is None:
+            self.report({'WARNING'}, "No 3D Viewport is open")
+            return {'CANCELLED'}
+        space = area.spaces.active
+        if _arcology_sidebar_showing(context):
+            space.show_region_ui = False
+        else:
+            space.show_region_ui = True
+            region.active_panel_category = "Arcology"
+        area.tag_redraw()
+        return {'FINISHED'}
+
+
+# The hexagon icon, embedded so it loads even if icon.png is not next to this file.
+_ICON_PNG_B64 = (
+    "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"
+    "fCEXP4iWAAAAAElFTkSuQmCC"
+)
+
+_icon_coll = None
+_ORIG_HEADER_DRAW = None
+
+
+def _load_arcology_icon():
+    """Load the embedded hexagon PNG as a custom icon."""
+    global _icon_coll
+    import base64
+    import os
+    import tempfile
+    import bpy.utils.previews
+    if _icon_coll is None:
+        _icon_coll = bpy.utils.previews.new()
+    if "hex" in _icon_coll:
+        return
+    try:
+        folder = bpy.app.tempdir or tempfile.gettempdir()
+        path = os.path.join(folder, "arcology_hex_icon.png")
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(_ICON_PNG_B64))
+        _icon_coll.load("hex", path, 'IMAGE')
+    except Exception as exc:
+        print("Arcology: could not load the hexagon icon:", exc)
+
+
+def _release_arcology_icon():
+    global _icon_coll
+    import bpy.utils.previews
+    if _icon_coll is not None:
+        bpy.utils.previews.remove(_icon_coll)
+        _icon_coll = None
+
+
+def _draw_arcology_header_button(layout):
+    """The Arcology button, drawn just left of the Properties search field."""
+    if _icon_coll is not None and "hex" in _icon_coll:
+        layout.operator("arcology.open_sidebar", text="",
+                        icon_value=_icon_coll["hex"].icon_id)
+    else:
+        layout.operator("arcology.open_sidebar", text="", icon='VIEW3D')
+
+
+class _ArcologyHeaderLayout:
+    """Wraps the header layout and inserts the button right before the search field."""
+
+    def __init__(self, layout):
+        self._layout = layout
+        self._done = False
+
+    def __getattr__(self, name):
+        return getattr(self._layout, name)
+
+    def prop(self, data, property, *args, **kwargs):
+        if not self._done and property == "search_filter":
+            self._done = True
+            _draw_arcology_header_button(self._layout)
+        return self._layout.prop(data, property, *args, **kwargs)
+
+
+class _ArcologyHeaderSelf:
+    def __init__(self, owner, layout):
+        self._owner = owner
+        self.layout = layout
+
+    def __getattr__(self, name):
+        return getattr(self._owner, name)
+
+
+def _arcology_header_draw(self, context):
+    wrapped = _ArcologyHeaderSelf(self, _ArcologyHeaderLayout(self.layout))
+    _ORIG_HEADER_DRAW(wrapped, context)
+
+
+def _install_arcology_header():
+    global _ORIG_HEADER_DRAW
+    if _ORIG_HEADER_DRAW is None:
+        _ORIG_HEADER_DRAW = bpy.types.PROPERTIES_HT_header.draw
+        bpy.types.PROPERTIES_HT_header.draw = _arcology_header_draw
+
+
+def _uninstall_arcology_header():
+    global _ORIG_HEADER_DRAW
+    if _ORIG_HEADER_DRAW is not None:
+        bpy.types.PROPERTIES_HT_header.draw = _ORIG_HEADER_DRAW
+        _ORIG_HEADER_DRAW = None
+
 
 CLASSES = (
-    OctagonProps,
     ArcologyProps,
+    OctagonProps,
+    RectProps,
+    PenroseProps,
+    ArcologyShared,
+    ArcologyEntry,
+    ARCOLOGY_UL_list,
     ARCOLOGY_OT_rebuild,
     ARCOLOGY_OT_clear,
     ARCOLOGY_OT_reseed,
+    ARCOLOGY_OT_add,
+    ARCOLOGY_OT_remove,
     ARCOLOGY_OT_collection_info,
     ARCOLOGY_OT_info,
     ARCOLOGY_PT_panel,
+    ARCOLOGY_OT_open_sidebar,
     ARCOLOGY_Preferences,
 )
 
@@ -2544,29 +4742,38 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.arcology_props = PointerProperty(type=ArcologyProps)
-    bpy.types.Scene.arcology_octagon = PointerProperty(type=OctagonProps)
+    _load_arcology_icon()
+    _install_arcology_header()
+    bpy.types.Scene.arcology_shared = PointerProperty(type=ArcologyShared)
+    bpy.types.Scene.arcologies = bpy.props.CollectionProperty(type=ArcologyEntry)
+    bpy.types.Scene.arcology_index = IntProperty(
+        name="Arcology", default=0, min=0,
+        description="The arcology the panel is showing")
     bpy.types.Scene.arcology_shape = EnumProperty(
         name="Shape",
         items=(
-            (SHAPE_HEX, "Hexagon", "The hexagon city"),
-            (SHAPE_OCT, "Octagon", "The octagon city, with square gaps"),
-            (SHAPE_RECT, "Rectangle", "Under construction"),
+            (SHAPE_HEX, "Hexagon", "The selected arcology is a hexagon city"),
+            (SHAPE_OCT, "Octagon", "The selected arcology is an octagon city, with square gaps"),
+            (SHAPE_RECT, "Rectangle", "A city of touching rectangles, with a 12 ft hallway down each road rectangle"),
+            (SHAPE_PEN, "Penrose", "A city of Penrose tiles: thick tiles are towers, thin tiles are roads"),
         ),
         default=SHAPE_HEX,
-        description="Which city the Build and Clear buttons work on")
+        description="The shape Build gives the selected arcology")
 
 
 def unregister():
     global _pending
+    _uninstall_arcology_header()
+    _release_arcology_icon()
     try:
         bpy.app.timers.unregister(_timer_fire)
     except Exception:
         pass
     _pending = False
     del bpy.types.Scene.arcology_shape
-    del bpy.types.Scene.arcology_octagon
-    del bpy.types.Scene.arcology_props
+    del bpy.types.Scene.arcology_index
+    del bpy.types.Scene.arcologies
+    del bpy.types.Scene.arcology_shared
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
 
