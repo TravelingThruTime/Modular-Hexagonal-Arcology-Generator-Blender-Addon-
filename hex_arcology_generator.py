@@ -21,7 +21,7 @@ so it can be sculpted into slopes. Without one, every hex gets the layer cap.
 bl_info = {
     "name": "Modular Hexagonal Arcology Generator",
     "author": "Traveling",
-    "version": (1, 4, 0),
+    "version": (1, 4, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Arcology",
     "description": "Generates the hex arcology from ultra-low-poly proxies, live, with sliders.",
@@ -687,18 +687,22 @@ def poly_area(poly):
 
 
 def _source_geometry(o):
-    """Footprint, height and anchors of one source object. Cached, since big meshes are slow to read."""
+    """Footprint, height and anchors of one source object, read in the object's own frame: its scale is kept, but its
+    turn about the vertical axis is not, since every copy is turned by the placement that makes it. Cached, since big
+    meshes are slow to read."""
     key = (o.as_pointer(), o.data.as_pointer(), tuple(round(x, 5) for row in o.matrix_world for x in row))
     hit = _SOURCE_CACHE.get(key)
     if hit is not None:
         return hit
-    verts = [o.matrix_world @ v.co for v in o.data.vertices]
+    loc, _turn, scale = o.matrix_world.decompose()
+    xform = Matrix.Translation(loc) @ Matrix.Diagonal(scale.to_4d())
+    verts = [xform @ v.co for v in o.data.vertices]
     lo = Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
     hi = Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
     bc = Vector(((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, lo.z))
     sample = verts[::max(1, len(verts) // 4000)]
     hull = convex_hull_2d([Vector((v.x - bc.x, v.y - bc.y)) for v in sample])
-    org = o.matrix_world.translation.copy()
+    org = xform.translation.copy()
     c0 = Vector((org.x, org.y))
     # The flat side is read from every vertex, not the sample: a sampled hull can pick a different long edge.
     hull0 = convex_hull_2d([Vector((v.x - c0.x, v.y - c0.y)) for v in verts])
@@ -715,9 +719,8 @@ def _source_geometry(o):
         cen = sum(hull0, Vector((0.0, 0.0))) / len(hull0)
         if ((a + b) * 0.5 - cen).dot(flat_normal) < 0:
             flat_normal = -flat_normal
-    geo = {"hull": hull, "height": hi.z - lo.z, "bottom_center": bc, "origin": org,
-           "zlo": lo.z - org.z, "c0": c0, "zb": lo.z, "f": flat_normal,
-           "rz": o.matrix_world.to_euler('XYZ').z}
+    geo = {"hull": hull, "height": hi.z - lo.z, "ext": Vector((hi.x - lo.x, hi.y - lo.y)), "bottom_center": bc,
+           "origin": org, "zlo": lo.z - org.z, "c0": c0, "zb": lo.z, "f": flat_normal, "rz": 0.0, "xform": xform}
     if len(_SOURCE_CACHE) > 64:
         _SOURCE_CACHE.clear()
     _SOURCE_CACHE[key] = geo
@@ -755,7 +758,38 @@ def hex_record(pool, rng, c, z, height, layer, L, group="Hexagons", cat="towers"
     Sc = Matrix.Diagonal(Vector((s, s, kz, 1.0)))
     T = Matrix.Translation(-src["bottom_center"])
     return {"group": group, "cat": cat, "layer": layer, "src": src,
-            "matrix": P_ @ Sc @ T @ src["obj"].matrix_world}
+            "matrix": P_ @ Sc @ T @ src["xform"]}
+
+
+def road_strip_record(pool, rng, centre, theta, length, width, z, height, layer):
+    """A copy of one Road object, as a road strip. Its origin sits at the centre of the strip and its X axis runs
+    along the road at angle theta. It is stretched to the strip's length and width, and to the road height."""
+    src = pool[rng.randrange(len(pool))]
+    xs = [v.x for v in src["hull"]]
+    ys = [v.y for v in src["hull"]]
+    ext_x = max(xs) - min(xs)
+    ext_y = max(ys) - min(ys)
+    kx = length / ext_x if ext_x > 1e-9 else 1.0
+    ky = width / ext_y if ext_y > 1e-9 else 1.0
+    kz = height / src["height"] if src["height"] > 0 else 1.0
+    C = Matrix.Translation((-src["c0"].x, -src["c0"].y, -src["zb"]))
+    Sz = Matrix.Diagonal(Vector((kx, ky, kz, 1.0)))
+    T = Matrix.Translation((centre.x, centre.y, z))
+    return {"group": "Road", "cat": "roads", "layer": layer, "src": src,
+            "matrix": T @ Matrix.Rotation(theta, 4, 'Z') @ Sz @ C @ src["xform"]}
+
+
+def stretch_record(pool, rng, centre, theta, length, width, z, height, layer, group, cat):
+    """A copy of one of your objects stretched to a rectangle: its length along the angle theta, its width across it,
+    one height tall, and its bottom centre on the centre of the rectangle. Used for Penrose roads and elevators."""
+    src = pool[rng.randrange(len(pool))]
+    kx = length / src["ext"].x if src["ext"].x > 1e-9 else 1.0
+    ky = width / src["ext"].y if src["ext"].y > 1e-9 else 1.0
+    kz = height / src["height"] if src["height"] > 0 else 1.0
+    P_ = Matrix.Translation((centre.x, centre.y, z)) @ Matrix.Rotation(theta, 4, 'Z')
+    Sz = Matrix.Diagonal(Vector((kx, ky, kz, 1.0)))
+    T = Matrix.Translation(-src["bottom_center"])
+    return {"group": group, "cat": cat, "layer": layer, "src": src, "matrix": P_ @ Sz @ T @ src["xform"]}
 
 
 def trap_record(pool, rng, spot, k, L):
@@ -770,7 +804,7 @@ def trap_record(pool, rng, spot, k, L):
     Sz = Matrix.Diagonal(Vector((1.0, 1.0, kz, 1.0)))
     T = Matrix.Translation((spot["c"].x, spot["c"].y, ROAD_BASE + k * L.PITCH))
     return {"group": "Road Trapezoids", "cat": "trapezoids", "layer": k + 1, "src": src,
-            "matrix": T @ Rm @ Sz @ C @ src["obj"].matrix_world}
+            "matrix": T @ Rm @ Sz @ C @ src["xform"]}
 
 
 def elevator_record(pool, rng, c, z, height, layer, xy=1.0):
@@ -782,7 +816,7 @@ def elevator_record(pool, rng, c, z, height, layer, xy=1.0):
     Sz = Matrix.Diagonal(Vector((xy, xy, kz, 1.0)))            # xy scales the shaft with the octagon edge
     T = Matrix.Translation((c.x, c.y, z))
     return {"group": "Elevators", "cat": "elevators", "layer": layer, "src": src,
-            "matrix": T @ Sz @ C @ src["obj"].matrix_world}
+            "matrix": T @ Sz @ C @ src["xform"]}
 
 
 def wall_record(pool, rng, centre, ang, z, height, layer, L, length=None, thick=None):
@@ -804,7 +838,7 @@ def wall_record(pool, rng, centre, ang, z, height, layer, L, length=None, thick=
          @ Matrix.Rotation(theta, 4, 'Z')
          @ Matrix.Diagonal(Vector((sx, sy, sz, 1.0)))
          @ Matrix.Translation(-src["bottom_center"])
-         @ src["obj"].matrix_world)
+         @ src["xform"])
     return {"group": "Walls", "cat": "walls", "layer": layer, "src": src, "matrix": M}
 
 
@@ -815,7 +849,7 @@ def park_record(src, cells, th, z_base, layer):
          @ Matrix.Rotation(th, 4, 'Z')
          @ Matrix.Translation(-src["origin"]))
     return {"group": "Parks", "cat": "parks", "layer": layer, "src": src,
-            "matrix": M @ src["obj"].matrix_world}
+            "matrix": M @ src["xform"]}
 
 
 def place_picked_parks(shapes, sites, rng, L):
@@ -861,27 +895,18 @@ def place_picked_parks(shapes, sites, rng, L):
 
 
 def write_copies(root, records):
-    """Writes the copies of your source objects into the Hexagons, Road Trapezoids and Parks groups."""
-    parents = {}
+    """Writes the copies of your source objects into their layer collections (walls into the Walls collection).
+    Each copy is a plain object with no parent, so no relationship lines are drawn to the origin."""
     for n, rec in enumerate(records):
-        key = (rec["cat"], rec["layer"])
         if rec["cat"] == "walls":
             coll = child_collection(root, WALL_COLLECTION)
         else:
             coll = layer_collection(root, rec["layer"])
-        if key not in parents:
-            # One empty per category per layer, so each layer still holds one object per category.
-            em = bpy.data.objects.new(f"{rec['cat']}_L{rec['layer']:02d}", None)
-            em.empty_display_type = 'PLAIN_AXES'
-            em.empty_display_size = 0.1
-            em[PROXY_TAG] = True
-            coll.objects.link(em)
-            parents[key] = em
         ob = rec["src"]["obj"].copy()
         ob.name = f"{rec['cat']}_copy_L{rec['layer']:02d}_{n:05d}"
         ob[PROXY_TAG] = True
         coll.objects.link(ob)
-        ob.parent = parents[key]
+        ob.parent = None                     # a copy of an object that has a parent would keep that parent
         ob.matrix_world = rec["matrix"]
     return len(records)
 
@@ -899,6 +924,8 @@ def build_city(p, fp=None, index=0):
     records = []                                    # copies of your objects, written after the proxies
     hex_src = source_pool(p.coll_hexagons)
     trap_src = source_pool(p.coll_trapezoids)
+    road_src = source_pool(p.coll_road)
+    road_rng = random.Random(seed * 7919 + 4)     # road strip picks have their own random sequence
     park_src = source_pool(p.coll_parks)
     wall_src = source_pool(p.coll_walls)
     roof_src = source_pool(p.coll_roof)
@@ -1011,16 +1038,20 @@ def build_city(p, fp=None, index=0):
             z = TILE_TOP + k * P
             roof(c, z + H_, z + P, k + 2)
 
-    # Roads: one piece per hex the road passes through, stopping at that hex's top layer.
+    # Roads: one strip per hex the road passes through, on the ground and on each level up to that hex's top layer.
+    # With Road picked, each strip is a copy of your Road object.
     if p.show_roads:
         for run in runs:
             d = (pts[run[-1]] - pts[run[0]]).normalized()
+            theta = math.atan2(d.y, d.x)
             for key in run:
                 c = pts[key]
-                add_prism(bucket("roads", 1), rect_poly(c, d, L.S / 2.0, road_w / 2.0), ROAD_BASE, ROAD_BASE + ROAD_H)
-                for k in range(1, hmax[key] - 1):
+                for k in [0] + list(range(1, hmax[key] - 1)):
                     z = ROAD_BASE + k * P
-                    add_prism(bucket("roads", k + 1), rect_poly(c, d, L.S / 2.0, road_w / 2.0), z, z + ROAD_H)
+                    if road_src:
+                        records.append(road_strip_record(road_src, road_rng, c, theta, L.S, road_w, z, ROAD_H, k + 1))
+                    else:
+                        add_prism(bucket("roads", k + 1), rect_poly(c, d, L.S / 2.0, road_w / 2.0), z, z + ROAD_H)
 
     # Trapezoids: stacked up to the layer under each hex's top.
     if p.show_trapezoids:
@@ -1248,7 +1279,7 @@ def poly_record(pool, rng, c, z, height, layer, apothem, sides, offset_deg, grou
     Sc = Matrix.Diagonal(Vector((s, s, kz, 1.0)))
     T = Matrix.Translation(-src["bottom_center"])
     return {"group": group, "cat": cat, "layer": layer, "src": src,
-            "matrix": P_ @ Sc @ T @ src["obj"].matrix_world}
+            "matrix": P_ @ Sc @ T @ src["xform"]}
 
 
 def oct_lattice(inside, lo, hi, rng, L):
@@ -1386,19 +1417,18 @@ def road_blocked_sides(links):
     return out
 
 
-def road_octagon_record(pool, rng, c, z, height, layer, horizontal, turn=0.0, src=None):
-    """A copy of one Road Octagons object on a road or junction octagon. Its origin sits at the centre of
-    the octagon cell, and it keeps its size. A road running north-south turns it 90 degrees. It is stretched
-    to the road height."""
+def road_octagon_record(pool, rng, c, z, height, layer, turn=0.0, src=None):
+    """A copy of one Quarter Octagons object on a road or junction octagon. Its origin sits at the centre of the
+    octagon cell, and it keeps its size. Your object is the quarter between +X and +Y. turn rotates it about the
+    centre, so the four copies (0, 90, 180 and 270 degrees) fill the cell. It is stretched to the road height."""
     if src is None:
         src = pool[rng.randrange(len(pool))]
     kz = height / src["height"] if src["height"] > 0 else 1.0
-    theta = (0.0 if horizontal else math.pi / 2.0) + turn
     C = Matrix.Translation((-src["c0"].x, -src["c0"].y, -src["zb"]))
     Sz = Matrix.Diagonal(Vector((1.0, 1.0, kz, 1.0)))
     T = Matrix.Translation((c.x, c.y, z))
-    return {"group": "Road Octagons", "cat": "roads", "layer": layer, "src": src,
-            "matrix": T @ Matrix.Rotation(theta, 4, 'Z') @ Sz @ C @ src["obj"].matrix_world}
+    return {"group": "Quarter Octagons", "cat": "roads", "layer": layer, "src": src,
+            "matrix": T @ Matrix.Rotation(turn, 4, 'Z') @ Sz @ C @ src["xform"]}
 
 
 def build_octagon_city(p, fp=None, index=0):
@@ -1422,8 +1452,10 @@ def build_octagon_city(p, fp=None, index=0):
     wall_src = source_pool(p.coll_walls)
     park_src = source_pool(p.coll_parks)
     elev_src = source_pool(p.coll_elevators)
-    road_src = source_pool(p.coll_road_octagons)
-    road_rng = random.Random(seed * 7919 + 24)
+    quarter_src = source_pool(p.coll_road_octagons)
+    road_src = source_pool(p.coll_road)
+    road_rng = random.Random(seed * 7919 + 24)       # quarter picks
+    strip_rng = random.Random(seed * 7919 + 26)      # road strip picks
 
     octs, sqs = oct_lattice(inside, lo, hi, rng, L)
     if not octs:
@@ -1532,18 +1564,15 @@ def build_octagon_city(p, fp=None, index=0):
             z = base + k * P
             roof(c, z + H_, z + P, k + 2)
 
-    # Roads. With Road Octagons picked, each road octagon gets a copy, one per level. Without it, each one is an
-    # octagon with a hallway through its centre along each road it connects to. Transport octagons (intersections)
-    # get only the road strips and elevators, no road octagon.
+    # Roads. Each road and junction octagon gets its road strips, one from the centre out to each side it leaves
+    # by. With Road picked, each strip is a copy of your Road object. With Quarter Octagons picked, each road octagon
+    # gets four copies per level, one in each quarter. Without it, each one is the octagon less its strips and
+    # hallways. Transport octagons (intersections) get only the road strips and elevators, no quarters.
     links = {}
     for a, b in edges:
         d = (b[0] - a[0], b[1] - a[1])
         links.setdefault(a, []).append(d)
         links.setdefault(b, []).append((-d[0], -d[1]))
-    horizontal = set()
-    for a, b in edges:
-        if a[1] == b[1]:                                   # the two octagons share a row, so the road runs east-west
-            horizontal.update((a, b))
     if p.show_roads:
         for key in sorted(roads | hubs):
             c = octs[key]
@@ -1552,16 +1581,19 @@ def build_octagon_city(p, fp=None, index=0):
                 z = ROAD_BASE + k * P
                 for dx, dy in dirs:                       # the 20 ft road, from the centre out to each side it leaves
                     u = Vector((dx, dy))
-                    add_prism(bucket("roads", k + 1), rect_poly(c + u * (L.APO / 2.0), u, L.APO / 2.0, L.ROAD_W / 2.0),
-                              z, z + ROAD_H)
-                if key not in roads:                      # a transport octagon is an intersection: no road octagon in it
+                    centre = c + u * (L.APO / 2.0)
+                    if road_src:
+                        records.append(road_strip_record(road_src, strip_rng, centre, math.atan2(dy, dx), L.APO,
+                                                         L.ROAD_W, z, ROAD_H, k + 1))
+                    else:
+                        add_prism(bucket("roads", k + 1), rect_poly(centre, u, L.APO / 2.0, L.ROAD_W / 2.0), z, z + ROAD_H)
+                if key not in roads:                      # a transport octagon is an intersection: no quarters in it
                     continue
-                if road_src:
-                    # Two copies per road cell, 180 degrees apart about the cell centre, from the same object.
-                    pick = road_src[road_rng.randrange(len(road_src))]
-                    for turn in (0.0, math.pi):
-                        records.append(road_octagon_record(road_src, road_rng, c, z, H_, k + 1, key in horizontal,
-                                                           turn, pick))
+                if quarter_src:
+                    # Four copies per road cell, one in each quarter about the cell centre, all from the same object.
+                    pick = quarter_src[road_rng.randrange(len(quarter_src))]
+                    for turn in (0.0, math.pi / 2.0, math.pi, 1.5 * math.pi):
+                        records.append(road_octagon_record(quarter_src, road_rng, c, z, H_, k + 1, turn, pick))
                 else:
                     for piece in road_octagon_pieces(c, dirs, L):
                         add_prism(bucket("road_octagons", k + 1), piece, z, z + H_)
@@ -1707,14 +1739,16 @@ def build_octagon_city(p, fp=None, index=0):
                     sides.append(m)
             add_oct_path(bucket("paths", Hp), c, z_path, path_rng, L, sides)
 
-    # Cells for the Stats box: every level of every octagon except junctions, less the top (park) level.
-    cells_counted = sum(max(0, hmax[key] - 1) for key in octs if key not in hubs)
-    if p.show_squares:
-        cells_counted += sum(max(0, sq_hmax[key] - 1) for key in sqs)
+    # Cells for the Stats box, every level, less the top (park) level. Octagons and squares are counted apart, and
+    # transport octagons (junctions) are left out of both.
+    octagon_cells = sum(max(0, hmax[key] - 1) for key in octs if key not in hubs)
+    square_cells = sum(max(0, sq_hmax[key] - 1) for key in sqs) if p.show_squares else 0
     stats = {
         "footprint": len(octs),
         "squares": len(sqs),
-        "cells_counted": cells_counted,
+        "octagon_cells": octagon_cells,
+        "square_cells": square_cells,
+        "cells_counted": octagon_cells + square_cells,
         "hexes": len(octs),
         "towers": len(towers),
         "transport": len(hubs),
@@ -1828,7 +1862,7 @@ def road_rect_record(src, c, z, height, layer, L, turn):
     Sz = Matrix.Diagonal(Vector((kx, ky, kz, 1.0)))
     T = Matrix.Translation((c.x, c.y, z))
     return {"group": "Road Rectangles", "cat": "roads", "layer": layer, "src": src,
-            "matrix": T @ Matrix.Rotation(turn, 4, 'Z') @ Sz @ C @ src["obj"].matrix_world}
+            "matrix": T @ Matrix.Rotation(turn, 4, 'Z') @ Sz @ C @ src["xform"]}
 
 
 def fit_to_rect(piece, theta, half_w, half_l):
@@ -1856,7 +1890,7 @@ def rect_record(pool, rng, c, z, height, layer, half_w, half_l, group, cat):
     Sc = Matrix.Diagonal(Vector((s, s, kz, 1.0)))
     T = Matrix.Translation(-src["bottom_center"])
     return {"group": group, "cat": cat, "layer": layer, "src": src,
-            "matrix": P_ @ Sc @ T @ src["obj"].matrix_world}
+            "matrix": P_ @ Sc @ T @ src["xform"]}
 
 
 def add_rect_path(bm, c, z0, rng, L, sides):
@@ -1941,6 +1975,8 @@ def build_rect_city(p, fp=None, index=0):
     tower_src = source_pool(p.coll_rectangles)
     width_road_src = source_pool(p.coll_width_road_rectangles)
     length_road_src = source_pool(p.coll_length_road_rectangles)
+    road_src = source_pool(p.coll_road)
+    strip_rng = random.Random(seed * 7919 + 27)      # road strip picks have their own random sequence
     roof_src = source_pool(p.coll_roof)
     wall_src = source_pool(p.coll_walls)
     park_src = source_pool(p.coll_parks)
@@ -2025,8 +2061,9 @@ def build_rect_city(p, fp=None, index=0):
         links.setdefault(a, []).append(d)
         links.setdefault(b, []).append((-d[0], -d[1]))
 
-    # Roads: a strip from the centre out to each side the road leaves by. With Road Rectangles picked, each road
-    # rectangle gets two copies, 180 degrees apart. Without, it is the rectangle less the strips and the hallway.
+    # Roads: a strip from the centre out to each side the road leaves by. With Road picked, each strip is a copy of
+    # your Road object. With Road Rectangles picked, each road rectangle gets two copies, 180 degrees apart. Without,
+    # it is the rectangle less the strips and the hallway.
     if p.show_roads:
         for key in sorted(roads | hubs):
             c = cells[key]
@@ -2036,8 +2073,12 @@ def build_rect_city(p, fp=None, index=0):
                 for dx, dy in dirs:
                     u = Vector((dx, dy))
                     reach = L.HW if dx else L.HL
-                    add_prism(bucket("roads", k + 1), rect_poly(s_centre(c, u, reach), u, reach / 2.0, L.ROAD_W / 2.0),
-                              z, z + ROAD_H)
+                    if road_src:
+                        records.append(road_strip_record(road_src, strip_rng, s_centre(c, u, reach), math.atan2(dy, dx),
+                                                         reach, L.ROAD_W, z, ROAD_H, k + 1))
+                    else:
+                        add_prism(bucket("roads", k + 1), rect_poly(s_centre(c, u, reach), u, reach / 2.0, L.ROAD_W / 2.0),
+                                  z, z + ROAD_H)
                 if key not in roads:                  # a junction: road strips and elevators only
                     continue
                 across = any(dx for dx, dy in dirs)               # a Width road runs across the width
@@ -2202,7 +2243,9 @@ PEN_F = np.array([[math.cos(math.radians(144 * k)), math.sin(math.radians(144 * 
 PEN_SHIFT = np.array([0.0137, 0.0291, 0.0053])
 PEN_MIN_EDGE_M = 6.0
 PEN_MAX_EDGE_M = 60.0
-PEN_ELEV_SHAFT_FT = 14.0                 # elevator shaft: 14 ft along each edge of a wide corner
+# The Penrose elevator: a low poly outline, (x along the road, y out from the road edge) in feet, at its real size.
+# Its flat side lies on the road edge. Picked objects are stretched to fill it.
+ELEVATOR_OUTLINE_FT = [(-13.761, 8.189), (-12.538, 0.0), (-1.185, 0.0), (12.538, 0.0), (12.866, 8.444), (-0.489, 12.641)]
 PEN_COLUMN_R = 1.5 * FT                  # column: a regular pentagon, 3 ft across the corners
 
 
@@ -2280,7 +2323,7 @@ def rhomb_record(pool, rng, cen, theta_base, rel, z, height, layer, group, cat):
     Sc = Matrix.Diagonal(Vector((s, s, kz, 1.0)))
     T = Matrix.Translation(-src["bottom_center"])
     return {"group": group, "cat": cat, "layer": layer, "src": src, "height": h,
-            "matrix": P_ @ Sc @ T @ src["obj"].matrix_world}
+            "matrix": P_ @ Sc @ T @ src["xform"]}
 
 
 def _pen_ccw(pts):
@@ -2335,16 +2378,6 @@ def _pen_pentagon(c, r):
             for k in range(5)]
 
 
-def _pen_shaft(t, ci, S):
-    """A parallelogram shaft in the wide corner ci of a thin tile: S along each of the two edges that meet there."""
-    pts = t["pts"]
-    n = len(pts)
-    V = pts[ci]
-    u = (pts[(ci + 1) % n] - V).normalized() * S
-    w = (pts[(ci - 1) % n] - V).normalized() * S
-    return _pen_ccw([V, V + u, V + u + w, V + w])
-
-
 def pen_tree_spots(t, n, rng, L):
     """Up to n tree positions inside one tile, kept clear of its edges, with canopies apart. Returns (position, scale)."""
     spots = []
@@ -2383,6 +2416,55 @@ def pen_bench_spots(t, n, trees, rng, L):
 
 
 
+def _pen_clip(pts, cen, n, off):
+    """The part of the convex polygon pts at or beyond the line set off from cen along the unit vector n."""
+    out = []
+    m = len(pts)
+    for i in range(m):
+        a, b = pts[i], pts[(i + 1) % m]
+        da = (a - cen).dot(n) - off
+        db = (b - cen).dot(n) - off
+        if da >= 0.0:
+            out.append(a)
+        if (da >= 0.0) != (db >= 0.0):
+            out.append(a + (b - a) * (da / (da - db)))
+    clean = []
+    for q in out:
+        if not clean or (q - clean[-1]).length > 1e-6:
+            clean.append(q)
+    if len(clean) > 1 and (clean[0] - clean[-1]).length <= 1e-6:
+        clean.pop()
+    return clean
+
+
+def _pen_halves(t, width):
+    """The two pieces of a thin tile, one on each side of its road: the part beyond each road edge. Returns
+    (centre, points relative to centre) pairs, counter-clockwise."""
+    out = []
+    u = t["road_u"]
+    across = Vector((-u.y, u.x))
+    for side in (1.0, -1.0):
+        piece = _pen_clip(t["pts"], t["cen"], across * side, width / 2.0)
+        if len(piece) < 3:
+            continue
+        piece = _pen_ccw(piece)
+        c = sum(piece, Vector((0.0, 0.0))) / len(piece)
+        out.append((c, [q - c for q in piece]))
+    return out
+
+
+def _fit_elevator(t, edge, n, u):
+    """The elevator outline beside a road, its flat side on the road edge at edge and centred along the road. It is
+    at its real size unless that would not fit inside the tile, when it is scaled down. Returns (corners, scale)."""
+    scale = 1.0
+    while scale >= 0.2:
+        pts = _pen_ccw([edge + u * (x * FT * scale) + n * (y * FT * scale) for x, y in ELEVATOR_OUTLINE_FT])
+        if all(_pen_inside(t["pts"], q, 0.5 * FT) for q in pts):
+            return pts, scale
+        scale -= 0.02
+    return None, 0.0
+
+
 def _pen_strip(t, width):
     """The road of a thin tile: a 12 ft strip along its long diagonal, from one 36-degree vertex to the other. It
     may cut a little into the towers beside it."""
@@ -2400,6 +2482,8 @@ def _pen_strip(t, width):
     t["road_cen"] = cen
     t["road_rel"] = rel
     t["road_theta"] = math.atan2(rel[1].y - rel[0].y, rel[1].x - rel[0].x)
+    t["road_u"] = u
+    t["road_len"] = (b - a).length
 
 
 def build_penrose_city(p, fp=None, index=0):
@@ -2417,7 +2501,9 @@ def build_penrose_city(p, fp=None, index=0):
     road_rng = random.Random(seed * 7919 + 24)
     elev_rng = random.Random(seed * 7919 + 23)
     tower_src = source_pool(p.coll_thick_rhombs)
-    road_src = source_pool(p.coll_thin_rhombs)
+    road_src = source_pool(p.coll_road)            # Roads: stretched along the long diagonal of each thin tile
+    half_src = source_pool(p.coll_thin_rhombs)     # Thin Half Rhombs: on each side of that road
+    half_rng = random.Random(seed * 7919 + 25)
     thick_roof_src = source_pool(p.coll_thick_roofs)
     thin_roof_src = source_pool(p.coll_thin_roofs)
     thick_park_src = source_pool(p.coll_thick_parks)
@@ -2459,6 +2545,7 @@ def build_penrose_city(p, fp=None, index=0):
     for t in tiles:
         if t["kind"] == 'thin' and len(t["wide"]) == 2 and len(t["acute"]) == 2:
             _pen_strip(t, p.road_width_ft * FT)
+            t["halves"] = _pen_halves(t, p.road_width_ft * FT)
 
     tmin, tmax = sorted((p.tower_min, p.tower_max))
     for t in tiles:
@@ -2512,10 +2599,14 @@ def build_penrose_city(p, fp=None, index=0):
             for k in range(max(1, t["top"] - 1)):
                 z = ROAD_BASE + k * P
                 if road_src:
-                    records.append(rhomb_record(road_src, road_rng, t["road_cen"], t["road_theta"], t["road_rel"],
-                                                z, ROAD_H, k + 1, "Thin Rhombs", "road_rectangles"))
+                    records.append(stretch_record(road_src, road_rng, t["road_cen"], t["road_theta"], t["road_len"],
+                                                  p.road_width_ft * FT, z, ROAD_H, k + 1, "Road", "road_rectangles"))
                 else:
                     add_prism(bucket("road_rectangles", k + 1), t["road_pts"], z, z + ROAD_H)
+                for hc, hrel in t["halves"]:
+                    if half_src:
+                        records.append(rhomb_record(half_src, half_rng, hc, t["road_theta"], hrel, z, ROAD_H, k + 1,
+                                                    "Thin Half Rhombs", "thin_halves"))
             for k in range(t["top"] - 1):
                 roof(t, ROAD_BASE + k * P + H_, ROAD_BASE + (k + 1) * P, k + 2)
 
@@ -2531,19 +2622,29 @@ def build_penrose_city(p, fp=None, index=0):
             if all((c - tiles[j]["cen"]).length >= p.elevator_distance for j in chosen):
                 chosen.append(i)
         elev_h = ELEVATOR_H_FT * FT
-        S = PEN_ELEV_SHAFT_FT * FT
+        elev_h = ELEVATOR_H_FT * FT
+        road_w = p.road_width_ft * FT
         for i in chosen:
             t = tiles[i]
+            u = t["road_u"]
+            across = Vector((-u.y, u.x))
             for ci in t["wide"]:
-                shaft = _pen_shaft(t, ci, S)
-                scen = sum(shaft, Vector((0.0, 0.0))) / 4.0
-                srel = [q - scen for q in shaft]
-                sth = math.atan2(srel[1].y - srel[0].y, srel[1].x - srel[0].x)
+                # The outline sits in this wide corner's half of the tile, its flat side on the road edge, centred
+                # along the road. Picked objects are stretched to fill its bounding box.
+                n = across if (t["pts"][ci] - t["cen"]).dot(across) > 0 else -across
+                edge = t["cen"] + n * (road_w / 2.0)
+                shaft, _scale = _fit_elevator(t, edge, n, u)
+                if shaft is None:
+                    continue
+                xs = [(q - edge).dot(u) for q in shaft]
+                ys = [(q - edge).dot(n) for q in shaft]
+                length, width = max(xs) - min(xs), max(ys) - min(ys)
+                centre = edge + u * ((max(xs) + min(xs)) / 2.0) + n * ((max(ys) + min(ys)) / 2.0)
                 for k in range(t["top"]):
                     z = ROAD_BASE + k * P
                     if elev_src:
-                        records.append(rhomb_record(elev_src, elev_rng, scen, sth, srel, z, elev_h, k + 1,
-                                                    "Elevators", "elevators"))
+                        records.append(stretch_record(elev_src, elev_rng, centre, t["road_theta"], length, width, z,
+                                                      elev_h, k + 1, "Elevators", "elevators"))
                     else:
                         add_prism(bucket("elevators", k + 1), shaft, z, z + elev_h)
                 elev_count += 1
@@ -2682,11 +2783,24 @@ def build_penrose_city(p, fp=None, index=0):
 # Output objects
 # ---------------------------------------------------------------------------
 def material_for(cat):
+    """Material for a category: the color shows in Solid mode (diffuse_color)
+    and in Rendered mode (the Principled BSDF Base Color)."""
     name = f"Arcology_{cat}"
+    color = CAT_COLORS[cat]
     mat = bpy.data.materials.get(name)
     if mat is None:
         mat = bpy.data.materials.new(name)
-    mat.diffuse_color = CAT_COLORS[cat]
+    mat.diffuse_color = color
+    mat.use_nodes = True
+    tree = mat.node_tree
+    bsdf = next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf is None:
+        bsdf = tree.nodes.new("ShaderNodeBsdfPrincipled")
+        out = next((n for n in tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+        if out is None:
+            out = tree.nodes.new("ShaderNodeOutputMaterial")
+        tree.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    bsdf.inputs["Base Color"].default_value = color
     return mat
 
 
@@ -2860,7 +2974,8 @@ def rebuild(scene, entry):
     elif is_oct:
         buckets, stats, records = build_octagon_city(props, fp, number - 1)
         props.last_footprint = stats["footprint"]
-        props.last_cell_count = stats["cells_counted"]
+        props.last_cell_count = stats["octagon_cells"]
+        props.last_square_count = stats["square_cells"]
         footprint, unit = stats["footprint"], "octagons"
     else:
         buckets, stats, records = build_city(props, fp, number - 1)
@@ -3011,6 +3126,10 @@ class ArcologyProps(PropertyGroup):
     coll_trapezoids: PointerProperty(
         name="Road Trapezoids", type=bpy.types.Collection, update=_on_change,
         description="Objects in this collection are copied onto the road hexes. Empty = generated trapezoids")
+    coll_road: PointerProperty(
+        name="Roads", type=bpy.types.Collection, update=_on_change,
+        description="Objects in this collection are copied onto the road hexes as road strips, at road height. "
+                    "The road runs along the object's X axis. Empty = generated road strips")
     coll_parks: PointerProperty(
         name="Parks", type=bpy.types.Collection, update=_on_change,
         description="Objects in this collection are copied onto the roofs as parks. Empty = generated parks")
@@ -3124,10 +3243,16 @@ class OctagonProps(PropertyGroup):
     coll_octagons: PointerProperty(
         name="Octagons", type=bpy.types.Collection, update=_on_oct_change,
         description="Objects in this collection are copied to fill the octagon towers. Empty = generated octagons")
+    # The identifier keeps its old name, so the picks in saved files still load. The label is Quarter Octagons.
     coll_road_octagons: PointerProperty(
-        name="Road Octagons", type=bpy.types.Collection, update=_on_oct_change,
-        description="Objects in this collection are copied onto the road and junction octagons, at road height. "
-                    "The road runs along the object's X axis. Empty = generated road strips")
+        name="Quarter Octagons", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied onto the road and junction octagons, four to a cell, one in "
+                    "each quarter, at road height. Each object is one quarter of the octagon with its origin at the centre, "
+                    "filling the quarter between +X and +Y. Empty = generated quarters")
+    coll_road: PointerProperty(
+        name="Roads", type=bpy.types.Collection, update=_on_oct_change,
+        description="Objects in this collection are copied onto the roads as road strips, at road height, one from the "
+                    "centre of each octagon to its edge. The road runs along the object's X axis. Empty = generated strips")
     coll_squares: PointerProperty(
         name="Squares", type=bpy.types.Collection, update=_on_oct_change,
         description="Objects in this collection are copied to fill the square towers. Empty = generated squares")
@@ -3152,12 +3277,16 @@ class OctagonProps(PropertyGroup):
                                   description="Random benches placed in each park octagon")
     last_cell_count: IntProperty(name="Octagon cells", default=0,
                                  description="Octagon cells in the last build, counted at every level, excluding junctions and the park layer (set by Build)")
+    last_square_count: IntProperty(name="Square cells", default=0,
+                                   description="Square cells in the last build, counted at every level, excluding the park layer (set by Build)")
     last_footprint: IntProperty(name="Footprint octagons", default=0,
                                 description="Octagons across the footprint in the last build (set by Build)")
     stat_residential: FloatProperty(name="Percent Residential", default=0.6, min=0.0, max=1.0, precision=2,
                                     description="Share of octagon cells that are residential, from 0 to 1")
     stat_residents: IntProperty(name="Residents per octagon", default=20, min=0,
                                 description="Residents in each residential octagon cell")
+    stat_residents_square: IntProperty(name="Residents per square", default=20, min=0,
+                                       description="Residents in each residential square cell")
     stat_cost: FloatProperty(name="Cost Per Octagon ($M)", default=2.0, min=0.0, precision=2,
                              description="Build cost of one octagon cell, in millions of dollars")
     stat_household: FloatProperty(name="Persons Per Household", default=2.6, min=0.1, max=20.0, precision=1,
@@ -3259,6 +3388,10 @@ class RectProps(PropertyGroup):
         name="Length Road Rectangles", type=bpy.types.Collection, update=_on_rect_change,
         description="Objects in this collection are copied onto the rectangles whose road runs along the length. "
                     "The road runs along Y and the hallway along X. Stretched to the rectangle. Empty = generated")
+    coll_road: PointerProperty(
+        name="Roads", type=bpy.types.Collection, update=_on_rect_change,
+        description="Objects in this collection are copied onto the roads as road strips, at road height, one from the "
+                    "centre of each rectangle to its edge. The road runs along the object's X axis. Empty = generated strips")
     coll_parks: PointerProperty(
         name="Parks", type=bpy.types.Collection, update=_on_rect_change,
         description="Objects in this collection are copied onto the roofs as parks. Empty = generated parks")
@@ -3300,6 +3433,8 @@ RECT_COLLECTION_INFO = (
     "the 12 ft hallway along Y. The object is stretched to the rectangle's width and length.",
     "Length Road Rectangles: put the origin at the centre of the rectangle. The road runs along Y (the length) and "
     "the 12 ft hallway along X. The object is stretched to the rectangle's width and length.",
+    "Roads: put the origin at the centre of the road strip. The road runs along the object's X axis. The copy is "
+    "stretched to the road width and from the rectangle centre to its edge.",
     "Roof: no origin needed. The add-on uses each object's bounding box.",
     "Parks: put the origin at the centre of the rectangle it sits on.",
     "Elevators: put the origin at the centre of the transport rectangle. One copy holds all four shafts.",
@@ -3326,6 +3461,7 @@ def _draw_rect(layout, entry):
     box.prop(q, "coll_rectangles")
     box.prop(q, "coll_width_road_rectangles")
     box.prop(q, "coll_length_road_rectangles")
+    box.prop(q, "coll_road")
     box.prop(q, "coll_parks")
     box.prop(q, "coll_walls")
     box.prop(q, "coll_roof")
@@ -3499,9 +3635,14 @@ class PenroseProps(PropertyGroup):
     coll_thick_rhombs: PointerProperty(
         name="Thick Rhombs", type=bpy.types.Collection, update=_on_pen_change,
         description="Objects in this collection are copied into the thick tiles as towers. Empty = generated towers")
+    coll_road: PointerProperty(
+        name="Roads", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied onto the thin tiles as roads, stretched along the long "
+                    "diagonal to the road width. Empty = generated roads")
     coll_thin_rhombs: PointerProperty(
-        name="Thin Rhombs", type=bpy.types.Collection, update=_on_pen_change,
-        description="Objects in this collection are copied onto the thin tiles as road surfaces. Empty = generated roads")
+        name="Thin Half Rhombs", type=bpy.types.Collection, update=_on_pen_change,
+        description="Objects in this collection are copied onto each side of the road on the thin tiles, one per side "
+                    "on each level of the road. Empty = nothing there")
     coll_thick_roofs: PointerProperty(
         name="Thick Roofs", type=bpy.types.Collection, update=_on_pen_change,
         description="Objects in this collection are copied onto the roofs of the thick tiles. Empty = generated roofs")
@@ -3520,18 +3661,18 @@ class PenroseProps(PropertyGroup):
     coll_elevators: PointerProperty(
         name="Elevators", type=bpy.types.Collection, update=_on_pen_change,
         description="Objects in this collection are copied into the elevator shafts. Empty = generated shafts")
-    last_cell_count: IntProperty(name="Tile cells", default=0,
-                                 description="Thick tile cells in the last build, counted at every level (set by Build)")
+    last_cell_count: IntProperty(name="Thick rhombi cells", default=0,
+                                 description="Thick rhombus cells in the last build, counted at every level (set by Build)")
     last_footprint: IntProperty(name="Footprint tiles", default=0,
                                 description="Tiles across the footprint in the last build (set by Build)")
     last_thick: IntProperty(name="Thick tiles", default=0,
                             description="Thick tiles in the last build (set by Build)")
     stat_residential: FloatProperty(name="Percent Residential", default=0.6, min=0.0, max=1.0, precision=2,
-                                    description="Share of thick tile cells that are residential, from 0 to 1")
-    stat_residents: IntProperty(name="Residents per tile", default=20, min=0,
-                                description="Residents in each residential tile cell")
-    stat_cost: FloatProperty(name="Cost Per Tile ($M)", default=2.0, min=0.0, precision=2,
-                             description="Build cost of one tile cell, in millions of dollars")
+                                    description="Share of thick rhombus cells that are residential, from 0 to 1")
+    stat_residents: IntProperty(name="Residents per thick rhombi", default=20, min=0,
+                                description="Residents in each residential thick rhombus cell. Thin rhombi hold no residents")
+    stat_cost: FloatProperty(name="Cost Per Thick Rhombus ($M)", default=2.0, min=0.0, precision=2,
+                             description="Build cost of one thick rhombus cell, in millions of dollars")
     stat_household: FloatProperty(name="Persons Per Household", default=2.6, min=0.1, max=20.0, precision=1,
                                   description="Average number of people in each household")
     stat_mortgage_rate: FloatProperty(name="Mortgage Rate", default=7.0, min=0.0, max=30.0, precision=2,
@@ -3543,11 +3684,12 @@ PENROSE_COLLECTION_INFO = (
     "Where the origin of your objects matters:",
     "",
     "Thick Rhombs (towers): no origin needed. Each copy is turned to the tile's edge, scaled to fill it and stretched to one level tall.",
-    "Thin Rhombs (roads): no origin needed. Each copy is fitted to the road along the long diagonal, and stretched to the road height.",
+    "Roads: no origin needed. Each copy is stretched along the long diagonal of a thin tile, to the road's length and width, and to the road height.",
+    "Thin Half Rhombs: no origin needed. Each copy is turned along the road and scaled evenly to fill the piece on one side of it, on each level of the road.",
     "Thick Roofs and Thin Roofs: no origin needed. Each copy is turned to the tile's edge, scaled to fill it and stretched to the roof height.",
     "Thick Parks and Thin Parks: no origin needed. Each copy is turned to the tile's edge, scaled to fill it, and sits on the top level.",
     "Walls: no origin needed. Each copy is turned out of the tile, its exterior facing west, and stretched to the edge length.",
-    "Elevators: no origin needed. Each copy is fitted to the 14 ft corner shaft and stretched to 36 ft per level.",
+    "Elevators: no origin needed. Each copy is stretched to the elevator outline, its flat side on the road edge, and to 36 ft per level.",
     "Heights come from each object's lowest point, so origin height does not matter.",
 )
 
@@ -3568,6 +3710,7 @@ def _draw_penrose(layout, entry):
     row.label(text="Collections")
     row.operator("arcology.collection_info", text="", icon='INFO')
     box.prop(q, "coll_thick_rhombs")
+    box.prop(q, "coll_road")
     box.prop(q, "coll_thin_rhombs")
     box.prop(q, "coll_thick_roofs")
     box.prop(q, "coll_thin_roofs")
@@ -3618,10 +3761,10 @@ def _draw_penrose(layout, entry):
     box = layout.box()
     box.label(text="Stats")
     cells = q.last_cell_count
-    if cells:
-        box.label(text=f"Cells, thick tiles (every layer, excluding parks): {cells:,}")
+    if q.last_footprint:
+        box.label(text=f"Cells, thick rhombi (every layer, excluding parks): {cells:,}")
     else:
-        box.label(text="Cells, thick tiles (every layer, excluding parks): build to count")
+        box.label(text="Cells, thick rhombi (every layer, excluding parks): build to count")
     box.prop(q, "stat_residential")
     box.prop(q, "stat_residents")
     box.prop(q, "stat_cost")
@@ -3781,6 +3924,8 @@ COLLECTION_INFO = (
     "Roof: no origin needed. The add-on uses each object's bounding box.",
     "Elevators: put the origin at the centre of the transport hex cell it sits in. One copy replaces all six shafts.",
     "Road Trapezoids: put the origin at the centre of the hex cell it sits in.",
+    "Roads: put the origin at the centre of the road hex. The road runs along the object's X axis. The copy is "
+    "stretched to one hex across and to the road width.",
     "Parks: put the origin at the centre of the park's first hex cell.",
     "Wall exteriors must be facing west, and wall lengths must be facing North/South.",
     "Heights come from each object's lowest point, so origin height does not matter.",
@@ -3790,7 +3935,10 @@ OCT_COLLECTION_INFO = (
     "Where the origin of your objects matters:",
     "",
     "Octagons: no origin needed. The add-on uses each object's bounding box.",
-    "Road Octagons: put the origin at the centre of the octagon cell. The road runs east-west along the object's X axis, and is turned 90 degrees for a north-south road.",
+    "Quarter Octagons: put the origin at the centre of the octagon cell. Your object is the quarter between +X and +Y. "
+    "The add-on copies it four times, turned 90 degrees each time, so four quarters fill each road octagon.",
+    "Roads: put the origin at the centre of the road strip. The road runs along the object's X axis. The copy is stretched "
+    "to the road width and from the octagon centre to its edge.",
     "Squares: no origin needed. Each copy fills one level of a square tower.",
     "Octagon Roofs: no origin needed. The add-on uses each object's bounding box.",
     "Square Roofs: no origin needed. The add-on uses each object's bounding box.",
@@ -3910,6 +4058,7 @@ def _draw_oct(layout, entry):
     row.operator("arcology.collection_info", text="", icon='INFO')
     box.prop(q, "coll_octagons")
     box.prop(q, "coll_road_octagons")
+    box.prop(q, "coll_road")
     box.prop(q, "coll_squares")
     box.prop(q, "coll_square_roofs")
     box.prop(q, "coll_parks")
@@ -3961,15 +4110,21 @@ def _draw_oct(layout, entry):
 
     box = layout.box()
     box.label(text="Stats")
-    cells = q.last_cell_count
-    if cells:
-        box.label(text=f"Cells, octagons and squares (every layer, excluding junctions and parks): {cells:,}")
+    built = q.last_footprint > 0
+    oct_cells, sq_cells = q.last_cell_count, q.last_square_count
+    if built:
+        box.label(text=f"Octagon cells (every layer, excluding junctions and parks): {oct_cells:,}")
+        box.label(text=f"Square cells (every layer, excluding parks): {sq_cells:,}")
     else:
-        box.label(text="Cells, octagons and squares (every layer, excluding junctions and parks): build to count")
+        box.label(text="Octagon cells (every layer, excluding junctions and parks): build to count")
+        box.label(text="Square cells (every layer, excluding parks): build to count")
     box.prop(q, "stat_residential")
     box.prop(q, "stat_residents")
+    box.prop(q, "stat_residents_square")
     box.prop(q, "stat_cost")
-    population = cells * q.stat_residential * q.stat_residents
+    cells = oct_cells + sq_cells
+    residents_all = oct_cells * q.stat_residents + sq_cells * q.stat_residents_square
+    population = q.stat_residential * residents_all
     cost_m = cells * q.stat_cost
     cost_text = f"${cost_m:,.1f} M" if cost_m < 1000 else f"${cost_m / 1000:,.2f} B"
     box.label(text=f"Estimated Population: {population:,.0f}")
@@ -3988,7 +4143,10 @@ def _draw_oct(layout, entry):
         box.label(text="Estimated Land Area: build to calculate")
     box.prop(q, "stat_household")
     box.prop(q, "stat_mortgage_rate")
-    households_per_cell = q.stat_residents / q.stat_household if q.stat_household > 0 else 0.0
+    # Cost per household: the cell cost divided by (residents per cell / persons per household). With squares and
+    # octagons, the residents per cell are averaged over every counted cell.
+    residents_per_cell = residents_all / cells if cells else q.stat_residents
+    households_per_cell = residents_per_cell / q.stat_household if q.stat_household > 0 else 0.0
     cost_per_household = (q.stat_cost * 1_000_000.0) / households_per_cell if households_per_cell > 0 else 0.0
     payment = monthly_mortgage_payment(cost_per_household, q.stat_mortgage_rate)
     box.label(text=f"Cost per household: ${cost_per_household:,.0f}")
@@ -4011,6 +4169,7 @@ def _draw_hex(layout, entry):
     row.operator("arcology.collection_info", text="", icon='INFO')
     box.prop(p, "coll_hexagons")
     box.prop(p, "coll_trapezoids")
+    box.prop(p, "coll_road")
     box.prop(p, "coll_parks")
     box.prop(p, "coll_walls")
     box.prop(p, "coll_roof")
