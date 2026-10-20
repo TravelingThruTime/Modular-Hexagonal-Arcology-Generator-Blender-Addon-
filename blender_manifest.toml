@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "modular_hexagonal_arcology_generator"
+version = "1.5.0"
+name = "Modular Arcology Generator"
+tagline = "Generate modular hexagonal arcologies live from proxy meshes"
+maintainer = "Traveling"
+type = "add-on"
+tags = ["Add Mesh", "Modeling"]
+blender_version_min = "4.2.0"
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+copyright = [
+  "2026 Traveling",
+]
